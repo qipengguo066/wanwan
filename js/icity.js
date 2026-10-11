@@ -532,13 +532,75 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
 
     return { systemPrompt, userPrompt: parts.join('\n\n') }
   }
-
-  function parseICityJSON(raw) {
-    let text = String(raw || '').trim()
-    if (text.startsWith('```')) {
-      text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
+  // 生成中的占位卡片
+  function addICityPendingCard(page, ctx) {
+    if (!page.querySelector('.icity-tab-home.active')) return null
+    const body = page.querySelector('#icity-body')
+    if (!body) return null
+    let feed = body.querySelector('.icity-feed')
+    if (!feed) {
+      body.innerHTML = '<div class="icity-feed"></div>'
+      feed = body.querySelector('.icity-feed')
     }
-    return JSON.parse(text)
+    const el = document.createElement('div')
+    el.className = 'icity-post icity-post-pending'
+    el.innerHTML = `
+      <div class="icity-post-head">
+        <span class="icity-post-avatar">${avatarHTML(ctx.friendAvatar, ctx.friendName)}</span>
+        <span class="icity-post-author">
+          <span class="icity-post-name">${icityEscHtml(ctx.friendName)}</span>
+          <span class="icity-post-account">正在写日记…</span>
+        </span>
+      </div>
+      <div class="icity-pending-dots"><i></i><i></i><i></i></div>`
+    feed.prepend(el)
+    return el
+  }
+
+  // 必须点“我已知晓”才能关闭的报错弹窗
+  function showICityErrorDialog({ title, message, detail }) {
+    if (document.getElementById('icity-error-modal')) return
+    const overlay = document.createElement('div')
+    overlay.className = 'sheet-overlay icity-generate-overlay'
+    overlay.id = 'icity-error-overlay'
+    const modal = document.createElement('div')
+    modal.className = 'center-modal icity-generate-modal'
+    modal.id = 'icity-error-modal'
+    modal.innerHTML = `
+      <div class="icity-generate-head"><div class="icity-generate-title">${icityEscHtml(title)}</div></div>
+      <div class="icity-error-msg">${icityEscHtml(message)}</div>
+      ${detail ? `<details class="icity-error-detail"><summary>查看更多</summary><pre>${icityEscHtml(detail)}</pre></details>` : ''}
+      <div class="icity-generate-actions">
+        <button class="icity-generate-confirm" type="button">我已知晓</button>
+      </div>`
+    const app = document.getElementById('app') || document.body
+    app.appendChild(overlay)
+    app.appendChild(modal)
+    requestAnimationFrame(() => {
+      overlay.classList.add('show')
+      modal.classList.add('show')
+    })
+    modal.querySelector('.icity-generate-confirm').addEventListener('click', () => {
+      overlay.classList.remove('show')
+      modal.classList.remove('show')
+      setTimeout(() => { overlay.remove(); modal.remove() }, 220)
+    })
+  }
+  
+   function parseICityJSON(raw) {
+    let text = String(raw || '').trim()
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
+    const start = text.indexOf('{')
+    const end = text.lastIndexOf('}')
+    if (start !== -1 && end > start) text = text.slice(start, end + 1)
+    try {
+      return JSON.parse(text)
+    } catch (e) {
+      const err = new Error('返回内容不是约定的 JSON 格式')
+      err.isParseError = true
+      err.rawOutput = String(raw || '').slice(0, 2000)
+      throw err
+    }
   }
 
   function makeICityNote(comment, fromType, fromName, replyToId, fromId) {
@@ -661,6 +723,52 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       window.toast?.('请先在设置里配置 API')
       return
     }
+    if (page._icityGenerating) {
+      window.toast?.('正在生成中，请稍等')
+      return
+    }
+    page._icityGenerating = true
+    ui?.close?.()
+
+    let pending = null
+    let raw = ''
+    try {
+      const ctx = await collectICityContext(ownerUid, friendId)
+      pending = addICityPendingCard(page, ctx)
+      const prompt = buildICityPrompt(ctx)
+      raw = await window.callAI(
+        [{ role: 'user', content: prompt.userPrompt }],
+        { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary'), responseFormat: 'json_object' }
+      )
+      const data = parseICityJSON(raw)
+      applyICityGenerated(ctx, data)
+      pending?.remove()
+      await renderICityHome(page)
+      showICityTopMessagePopup({
+        title: 'iCity',
+        body: `${ctx.friendName}更新了1篇日记`,
+        avatar: ctx.friendAvatar,
+        open: () => window.showICityPage && window.showICityPage()
+      })
+    } catch (e) {
+      pending?.remove()
+      const msg = e?.message || String(e)
+      let message = msg
+      if (e?.isParseError) {
+        message = '这个模型没有按日记格式返回内容，可以重试，或换一个模型。'
+      } else if (msg.includes('API') || msg.includes('配置') || msg.includes('Base URL') || msg.includes('Key') || msg.includes('模型')) {
+        message = '请先检查设置里的 API 配置。'
+      }
+      const rawText = e?.rawOutput || raw
+      showICityErrorDialog({
+        title: 'iCity 日记生成失败',
+        message,
+        detail: msg + (rawText ? '\n\n模型原始返回：\n' + String(rawText).slice(0, 2000) : '')
+      })
+    } finally {
+      page._icityGenerating = false
+    }
+  }
 
     const confirm = ui?.confirm
     const originalText = confirm?.innerHTML
