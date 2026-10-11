@@ -1,4 +1,4 @@
-// icity.js - iCity 日记入口
+// icity.js - iCity 日记入口 假装做了一些修改
 // 依赖：db.js, main.js, wechat.js
 
 (function() {
