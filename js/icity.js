@@ -770,43 +770,6 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     }
   }
 
-    const confirm = ui?.confirm
-    const originalText = confirm?.innerHTML
-    if (confirm) {
-      confirm.disabled = true
-      confirm.innerHTML = '<i class="fa fa-spinner fa-spin"></i>'
-    }
-    ui?.close?.()
-    window.toast?.('正在生成日记…')
-
-    try {
-      const ctx = await collectICityContext(ownerUid, friendId)
-      const prompt = buildICityPrompt(ctx)
-      const raw = await window.callAI(
-        [{ role: 'user', content: prompt.userPrompt }],
-        { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary'), responseFormat: 'json_object' }
-      )
-      const data = parseICityJSON(raw)
-      applyICityGenerated(ctx, data)
-      await renderICityHome(page)
-      showICityTopMessagePopup({
-        title: 'iCity',
-        body: `${ctx.friendName}更新了1篇日记`,
-        avatar: ctx.friendAvatar,
-        open: () => window.showICityPage && window.showICityPage()
-      })
-    } catch (e) {
-      const msg = e?.message || String(e)
-      const isConfigError = msg.includes('API') || msg.includes('配置') || msg.includes('Base URL') || msg.includes('Key') || msg.includes('模型')
-      window.toast?.(isConfigError ? '请先在设置里配置 API' : '生成失败：' + msg)
-    } finally {
-      if (confirm) {
-        confirm.disabled = false
-        confirm.innerHTML = originalText || '确认'
-      }
-    }
-  }
-
   // ===== 个人主页（点击底栏头像出现） =====
   function renderICityProfileHome(page) {
     const body = page.querySelector('#icity-body')
