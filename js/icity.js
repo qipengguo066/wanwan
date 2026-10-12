@@ -528,7 +528,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
   "noteReplies": ${ctx.pendingNotes.length ? '[{ "to": "对方那条小纸条的原文", "comment": "你的回应" }]' : '[]'},
   "notesForUserDiary": ${ctx.userDiary ? '[{ "comment": "你想给这篇日记留的小纸条" }]' : '[]'}
 }
-说明：没有附加任务时，对应的数组返回 []。`)
+说明：没有附加任务时，对应的数组返回 []。日记正文里如果要引用别人说的话，请用「」，不要用英文双引号。`)
 
     return { systemPrompt, userPrompt: parts.join('\n\n') }
   }
@@ -587,7 +587,23 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     })
   }
   
-   function parseICityJSON(raw) {
+  function rescueICityJSON(text) {
+    const m = text.match(/"diary"\s*:\s*"([\s\S]*?)"\s*,\s*"noteReplies"\s*:/)
+    if (!m) return null
+    const diary = m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').trim()
+    const readArr = key => {
+      const mm = text.match(new RegExp('"' + key + '"\\s*:\\s*(\\[[\\s\\S]*?\\])\\s*(?:,\\s*"|\\})'))
+      if (!mm) return []
+      try { return JSON.parse(mm[1]) } catch (_) { return [] }
+    }
+    return {
+      diary,
+      noteReplies: readArr('noteReplies'),
+      notesForUserDiary: readArr('notesForUserDiary')
+    }
+  }
+
+  function parseICityJSON(raw) {
     let text = String(raw || '').trim()
     text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
     const start = text.indexOf('{')
@@ -596,13 +612,14 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     try {
       return JSON.parse(text)
     } catch (e) {
+      const rescued = rescueICityJSON(text)
+      if (rescued) return rescued
       const err = new Error('返回内容不是约定的 JSON 格式')
       err.isParseError = true
       err.rawOutput = String(raw || '').slice(0, 2000)
       throw err
     }
   }
-
   function makeICityNote(comment, fromType, fromName, replyToId, fromId) {
     const createdAt = Date.now()
     return {
