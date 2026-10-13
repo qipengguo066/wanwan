@@ -1340,3 +1340,8 @@
 .icity-error-msg { padding: 8px 16px; font-size: 14px; line-height: 1.6; }
 .icity-error-detail { margin: 0 16px 12px; font-size: 12px; }
 .icity-error-detail pre { white-space: pre-wrap; word-break: break-all; max-height: 160px; overflow: auto; margin: 8px 0 0; }
+.icity-ai-reply-bar { display: flex; justify-content: center; padding: 12px 22px; border-top: 1px solid #f0f0f2; }
+.icity-detail-card + .icity-ai-reply-bar { border-top: 8px solid #f6f7f9; }
+.icity-ai-reply-btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 18px; border-radius: 17px; border: 1px solid #85ACDF; background: #fff; color: #85ACDF; font-size: 13px; font-weight: 600; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.icity-ai-reply-btn:not(:disabled):active { background: #f2f7ff; }
+.icity-ai-reply-btn:disabled { opacity: 0.6; cursor: default; }
