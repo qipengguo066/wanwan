@@ -113,6 +113,7 @@
                 fromType,
                 fromName: String(note?.fromName || '').trim(),
                 replyToId: note?.replyToId || null,
+                fromId: note?.fromId ?? null,
                 createdAt: noteCreatedAt
               }
             })
@@ -320,7 +321,7 @@
     await renderICityHome(page)
   }
 
-  async function showICityGenerateModal(page) {
+  async function showICityFriendPicker(page, { title, onConfirm }) {
     const ownerUid = page?._icityState?.ownerUid
     if (!ownerUid || document.getElementById('icity-generate-modal')) return
 
@@ -333,7 +334,7 @@
     modal.id = 'icity-generate-modal'
     modal.innerHTML = `
       <div class="icity-generate-head">
-        <div class="icity-generate-title">生成日记</div>
+        <div class="icity-generate-title">${icityEscHtml(title)}</div>
       </div>
       <div class="icity-generate-list">
         <div class="icity-generate-loading"><i class="fa fa-spinner fa-spin"></i></div>
@@ -367,7 +368,7 @@
       const active = modal.querySelector('.icity-generate-friend.active')
       const friendId = Number(active?.dataset.friendId)
       if (!friendId) return
-      runICityDiaryGeneration(page, friendId, {
+      onConfirm(friendId, {
         confirm: modal.querySelector('.icity-generate-confirm'),
         close
       })
@@ -376,6 +377,13 @@
     const friends = await loadICityFriendCharacters(ownerUid)
     if (!document.body.contains(modal)) return
     renderICityGenerateFriendList(modal, friends)
+  }
+
+  function showICityGenerateModal(page) {
+    return showICityFriendPicker(page, {
+      title: '生成日记',
+      onConfirm: (friendId, ui) => runICityDiaryGeneration(page, friendId, ui)
+    })
   }
 
   function renderICityGenerateFriendList(modal, friends) {
@@ -417,7 +425,44 @@
     })
   }
 
-  async function collectICityContext(ownerUid, friendId) {
+  // ===== 日记 / 小纸条：读取资料 =====
+  const ICITY_CHAT_LIMIT_FIRST = 30   // 第一次生成（还没有日记）最多读多少条聊天
+  const ICITY_CHAT_LIMIT_SINCE = 150  // 上次日记之后最多读多少条聊天
+  const ICITY_NOTE_CHAT_LIMIT = 10    // 回复小纸条时参考的最近聊天条数
+  const ICITY_DAY_START_HOUR = 5      // 凌晨几点之前算前一天（改成 0 就是严格按自然日）
+
+  function icityTs(value) {
+    const n = Number(value)
+    if (Number.isFinite(n) && n > 0) return n
+    const t = new Date(value).getTime()
+    return Number.isFinite(t) ? t : 0
+  }
+
+  function icityDayLabel(ts) {
+    const d = new Date(ts - ICITY_DAY_START_HOUR * 3600 * 1000)
+    return `${d.getMonth() + 1}月${d.getDate()}日`
+  }
+
+  function icityTimeLabel(ts) {
+    const d = new Date(ts)
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  }
+
+  function formatICityChatForPrompt(items) {
+    let lastDay = ''
+    const lines = []
+    items.forEach(item => {
+      const day = item.ts ? icityDayLabel(item.ts) : ''
+      if (day && day !== lastDay) {
+        lines.push(`【${day}】`)
+        lastDay = day
+      }
+      lines.push(`${item.ts ? icityTimeLabel(item.ts) + ' ' : ''}${item.speaker}: ${item.text}`)
+    })
+    return lines.join('\n')
+  }
+
+  async function collectICityBase(ownerUid, friendId) {
     const char = await db.characters.get(friendId)
     if (!char) throw new Error('角色不存在')
     const owner = await db.characters.get(Number(ownerUid))
@@ -446,55 +491,86 @@
     }
     const loreText = loreEntries.join('\n\n')
 
-    let recent = []
-    const chat = await db.chats.where('[ownerUid+charId]').equals([ownerUid, friendId]).first()
-    if (chat) {
-      const msgs = await db.messages.where('chatId').equals(chat.id).sortBy('createdAt')
-      recent = msgs.slice(-30).map(m => ({
-        speaker: m.role === 'user' ? '我' : friendName,
-        text: resolveICityPromptPlaceholders(m.content, placeholderCtx).trim()
-      })).filter(x => x.text)
-    }
+    return { ownerUid, friendId, userName, charName, friendName, friendAvatar, persona, charRole, loreText }
+  }
 
+  async function loadICityChatSince(base, sinceTs, limit) {
+    const chat = await db.chats.where('[ownerUid+charId]').equals([base.ownerUid, base.friendId]).first()
+    if (!chat) return []
+    const msgs = await db.messages.where('chatId').equals(chat.id).sortBy('createdAt')
+    return msgs
+      .map(m => ({ ts: icityTs(m.createdAt), role: m.role, content: m.content }))
+      .filter(m => !sinceTs || m.ts > sinceTs)
+      .slice(-limit)
+      .map(m => ({
+        ts: m.ts,
+        speaker: m.role === 'user' ? base.userName : base.friendName,
+        text: resolveICityPromptPlaceholders(m.content, base).trim()
+      }))
+      .filter(x => x.text)
+  }
+
+  // 写日记：读取该角色上一篇日记之后的聊天
+  async function collectICityContext(ownerUid, friendId) {
+    const base = await collectICityBase(ownerUid, friendId)
     const posts = loadICityPosts(ownerUid)
-    const previousRolePost = posts.find(post => post.authorType === 'role' && Number(post.authorId) === Number(friendId)) || null
-    const pendingNotes = previousRolePost
-      ? (previousRolePost.notes || []).filter(note => {
-          if (note.fromType !== 'self' || note.replyToId) return false
-          return !(previousRolePost.notes || []).some(reply => reply.fromType === 'role' && String(reply.replyToId) === String(note.id))
-        })
-      : []
-    const resolvedPendingNotes = pendingNotes.map(note => ({
-      ...note,
-      comment: resolveICityPromptPlaceholders(note.comment, placeholderCtx).trim()
-    })).filter(note => note.comment)
-    const rawUserDiary = posts.find(post =>
-      post.authorType !== 'role' &&
-      !(post.notes || []).some(n => n.fromType === 'role' && Number(n.fromId) === Number(friendId))
-    ) || null
-    const userDiary = rawUserDiary
-      ? { ...rawUserDiary, text: resolveICityPromptPlaceholders(rawUserDiary.text, placeholderCtx).trim() }
-      : null
+    const previousRolePost = posts.find(p => p.authorType === 'role' && Number(p.authorId) === Number(friendId)) || null
+    const sinceTs = previousRolePost ? previousRolePost.createdAt : 0
+    const recent = await loadICityChatSince(base, sinceTs, sinceTs ? ICITY_CHAT_LIMIT_SINCE : ICITY_CHAT_LIMIT_FIRST)
+    const previousDiary = previousRolePost
+      ? resolveICityPromptPlaceholders(previousRolePost.text, base).trim().slice(0, 600)
+      : ''
+    return { ...base, recent, previousDiary }
+  }
 
+  function isICityNoteFromFriend(note, friendId, friendName) {
+    if (note.fromType !== 'role') return false
+    return note.fromId != null ? Number(note.fromId) === Number(friendId) : note.fromName === friendName
+  }
+
+  // 小纸条回复：读取这篇日记、整串小纸条、待回复的条目
+  async function collectICityNoteContext(ownerUid, friendId, post) {
+    const base = await collectICityBase(ownerUid, friendId)
+    const notes = (Array.isArray(post.notes) ? post.notes : []).slice().sort((a, b) => a.createdAt - b.createdAt)
+    const byId = new Map(notes.map(n => [String(n.id), n]))
+    const isMine = n => isICityNoteFromFriend(n, friendId, base.friendName)
+
+    // 待回复 = 用户写的、还没被这个角色回复过的小纸条（包括对角色小纸条的回复）
+    const pending = notes.filter(note => {
+      if (note.fromType !== 'self') return false
+      if (notes.some(r => isMine(r) && String(r.replyToId) === String(note.id))) return false
+      if (!note.replyToId) return true
+      const parent = byId.get(String(note.replyToId))
+      return !parent || parent.fromType === 'self' || isMine(parent)
+    }).slice(0, 8)
+
+    const isUserPost = post.authorType !== 'role'
+    const hasMine = notes.some(isMine)
+    const mode = pending.length ? 'reply' : (isUserPost && !hasMine ? 'comment' : 'none')
+
+    const nameOf = n => n.fromType === 'self' ? base.userName : (isMine(n) ? base.friendName : (n.fromName || '别人'))
+    const pendingIndex = new Map(pending.map((n, i) => [String(n.id), i + 1]))
+    const thread = notes.map(n => {
+      const parent = n.replyToId ? byId.get(String(n.replyToId)) : null
+      const head = parent ? `${nameOf(n)}（回复${nameOf(parent)}）` : nameOf(n)
+      const tag = pendingIndex.has(String(n.id)) ? `【待回复 #${pendingIndex.get(String(n.id))}】` : ''
+      return `${tag}${head}：${resolveICityPromptPlaceholders(n.comment, base).trim()}`
+    }).join('\n')
+
+    const recent = await loadICityChatSince(base, 0, ICITY_NOTE_CHAT_LIMIT)
     return {
-      ownerUid,
-      friendId,
-      userName,
-      charName,
-      friendName,
-      friendAvatar,
-      persona,
-      charRole,
-      loreText,
+      ...base,
+      post,
+      mode,
+      pending,
+      thread,
       recent,
-      previousRolePost,
-      pendingNotes: resolvedPendingNotes,
-      userDiary
+      isUserPost,
+      diaryText: resolveICityPromptPlaceholders(post.text, base).trim().slice(0, 1500)
     }
   }
 
   function buildICityPrompt(ctx) {
-    const recentChat = ctx.recent.map(item => `${item.speaker}: ${item.text}`).join('\n')
     const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
 ${ctx.persona || '暂无额外设定。'}
 ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
@@ -506,32 +582,46 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
 · 多写具体的事，比如：今天吃了什么、出门看到了什么、和谁说了什么话、心里在想什么。不要只写空泛的感受。应当有独特性和实效性，可以令人明确感知到个人特质和具体某天的所思所想。
 · 字数 500 到 3000 字之间。想多写就多写，想少写就少写，不用硬凑字数。
 · 不要在日记里写日期、星期、标题、或者「第几天」这种字。时间由系统单独记，你只写日记内容就行。
-· 不要输出任何双花括号包裹的模板占位符。`
+· 不要输出任何双花括号包裹的模板占位符。
+· 直接输出日记正文，纯文本。不要标题，不要代码块，不要在日记前后加任何说明或总结。`
 
     const parts = [`请以「${ctx.friendName}」的身份，写下今天的这篇日记。`]
-    if (recentChat) {
-      parts.push(`【可参考的近况】（仅作灵感，别照搬聊天原文，要转成日记口吻写感受）：\n${recentChat}`)
+    if (ctx.previousDiary) {
+      parts.push(`【你上一篇日记】（只用来保持前后连贯，不要重复里面写过的内容）：\n${ctx.previousDiary}`)
     }
-
-    const taskParts = []
-    if (ctx.pendingNotes.length) {
-      taskParts.push(`（A）下面是别人在你上一篇日记下留的小纸条，请逐条用「${ctx.friendName}」会有的口气回应，像朋友间随手回话那样自然简短：\n${ctx.pendingNotes.map(note => `  - 对方小纸条：${note.comment}`).join('\n')}`)
+    if (ctx.recent.length) {
+      const dayRule = ICITY_DAY_START_HOUR > 0 ? `，凌晨 ${ICITY_DAY_START_HOUR} 点前的消息算前一天` : ''
+      parts.push(`【自上一篇日记以来，你和${ctx.userName}的聊天】（按日期排列${dayRule}；仅作灵感，别照搬聊天原文，要转成日记口吻写感受）：\n${formatICityChatForPrompt(ctx.recent)}`)
+    } else {
+      parts.push('【近况】这段时间你们没有新的聊天。可以写写你自己的日常和心情，不要编造你们之间发生过的事。')
     }
-    if (ctx.userDiary) {
-      taskParts.push(`（B）这是对方写的一篇日记，读完后请你以「${ctx.friendName}」的身份给它留小纸条，就像看到朋友的日记后随手评论几句，真诚、自然、带点你自己的语气，几条都行、顺着感觉来：\n  日记内容：${ctx.userDiary.text.slice(0, 1500)}`)
-    }
-    if (taskParts.length) parts.push(`【附加任务】\n${taskParts.join('\n\n')}`)
-
-    parts.push(`【输出格式】只返回下面这个 JSON，不要附加任何解释或代码块标记：
-{
-  "diary": "日记正文，纯文本，换行用 \\n",
-  "noteReplies": ${ctx.pendingNotes.length ? '[{ "to": "对方那条小纸条的原文", "comment": "你的回应" }]' : '[]'},
-  "notesForUserDiary": ${ctx.userDiary ? '[{ "comment": "你想给这篇日记留的小纸条" }]' : '[]'}
-}
-说明：没有附加任务时，对应的数组返回 []。日记正文里如果要引用别人说的话，请用「」，不要用英文双引号。`)
-
     return { systemPrompt, userPrompt: parts.join('\n\n') }
   }
+
+  function buildICityNotePrompt(ctx) {
+    const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
+${ctx.persona || '暂无额外设定。'}
+${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
+你正在看一篇日记下面的「小纸条」（类似朋友之间的评论区），要用「${ctx.friendName}」的口吻留言或回复。要求：
+· 像朋友间随手回话，自然、简短，一般 1 到 3 句，不要写成长篇大论。
+· 一定要针对对方那条小纸条的具体内容回应，先认真读懂对方说了什么，再回答。
+· 小纸条对话里你已经说过的话不要重复，也不要换个说法再说一遍同样的意思，要顺着对话往下推进。
+· 不要输出任何双花括号包裹的模板占位符。`
+
+    const authorLine = ctx.isUserPost
+      ? `这是${ctx.userName}写的日记：`
+      : `这是你自己（${ctx.friendName}）写的日记：`
+    const parts = [`${authorLine}\n${ctx.diaryText}`]
+    if (ctx.thread) parts.push(`【这篇日记下面目前的小纸条】（按时间顺序）：\n${ctx.thread}`)
+    if (ctx.recent.length) parts.push(`【你们最近的聊天，仅作背景参考】：\n${formatICityChatForPrompt(ctx.recent)}`)
+    if (ctx.mode === 'reply') {
+      parts.push('【任务】请逐条回复标有「待回复」的小纸条。每条回复写一行，格式严格如下（编号对应「待回复 #编号」）：\n回复#1：你的回复内容\n回复#2：你的回复内容\n不要输出其他任何说明。')
+    } else {
+      parts.push('【任务】请给这篇日记留 1 到 2 条小纸条评论，每条写一行，格式严格如下：\n评论：你的评论内容\n不要输出其他任何说明。')
+    }
+    return { systemPrompt, userPrompt: parts.join('\n\n') }
+  }
+  
   // 生成中的占位卡片
   function addICityPendingCard(page, ctx) {
     if (!page.querySelector('.icity-tab-home.active')) return null
@@ -633,64 +723,81 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     }
   }
 
-  function applyICityGenerated(ctx, data) {
-    const diary = resolveICityPromptPlaceholders(data?.diary, ctx).trim()
-    if (diary.length < 50) throw new Error('AI 返回的日记太短，请重试')
+  function cleanICityDiaryText(raw) {
+    let text = String(raw || '').trim()
+    text = text.replace(/^```[a-z]*\s*/i, '').replace(/\s*```$/, '').trim()
+    // 兼容少数模型仍然返回 JSON 的情况
+    if (text.startsWith('{')) {
+      try {
+        const data = JSON.parse(text)
+        if (data && typeof data.diary === 'string') text = data.diary.trim()
+      } catch (_) {}
+    }
+    return text.replace(/^(?:日记|正文)\s*[：:]\s*/, '').trim()
+  }
 
+  function applyICityDiary(ctx, text) {
+    const diary = resolveICityPromptPlaceholders(text, ctx).trim()
+    if (diary.length < 50) {
+      const err = new Error('AI 返回的日记太短，请重试')
+      err.rawOutput = text
+      throw err
+    }
     const posts = loadICityPosts(ctx.ownerUid)
-    const now = Date.now()
-    const newPost = {
+    posts.unshift({
       id: makeICityId('post'),
       text: diary,
-      createdAt: now,
+      createdAt: Date.now(),
       authorType: 'role',
       authorId: ctx.friendId,
       liked: false,
       notes: []
-    }
-
-    const previousRolePost = ctx.previousRolePost
-      ? posts.find(post => String(post.id) === String(ctx.previousRolePost.id) || post.createdAt === ctx.previousRolePost.createdAt)
-      : null
-    const userDiary = ctx.userDiary
-      ? posts.find(post => String(post.id) === String(ctx.userDiary.id) || post.createdAt === ctx.userDiary.createdAt)
-      : null
-
-    let replyCount = 0
-    const replies = Array.isArray(data?.noteReplies) ? data.noteReplies : []
-    if (previousRolePost && ctx.pendingNotes.length && replies.length) {
-      const used = new Set()
-      replies.forEach((reply, idx) => {
-        const comment = resolveICityPromptPlaceholders(reply?.comment, ctx).trim()
-        if (!comment) return
-        const to = resolveICityPromptPlaceholders(reply?.to, ctx).trim()
-        let target = null
-        if (to) {
-          target = ctx.pendingNotes.find(note => !used.has(String(note.id)) && note.comment === to)
-            || ctx.pendingNotes.find(note => !used.has(String(note.id)) && (note.comment.includes(to) || to.includes(note.comment)))
-        }
-        if (!target) target = ctx.pendingNotes.find((note, noteIdx) => !used.has(String(note.id)) && noteIdx >= idx) || ctx.pendingNotes.find(note => !used.has(String(note.id)))
-        if (!target) return
-        previousRolePost.notes.push(makeICityNote(comment, 'role', ctx.friendName, target.id, ctx.friendId))
-        used.add(String(target.id))
-        replyCount += 1
-      })
-    }
-
-    let userNoteCount = 0
-    const userNotes = Array.isArray(data?.notesForUserDiary) ? data.notesForUserDiary : []
-    if (userDiary && userNotes.length) {
-      userNotes.forEach(note => {
-        const comment = resolveICityPromptPlaceholders(note?.comment, ctx).trim()
-        if (!comment) return
-        userDiary.notes.push(makeICityNote(comment, 'role', ctx.friendName, null, ctx.friendId))
-        userNoteCount += 1
-      })
-    }
-
-    posts.unshift(newPost)
+    })
     saveICityPosts(ctx.ownerUid, posts)
-    return { replyCount, userNoteCount }
+  }
+
+  function parseICityNoteLines(raw) {
+    const entries = []
+    String(raw || '').split(/\r?\n/).forEach(line => {
+      const text = line.trim()
+      if (!text) return
+      let m = text.match(/^回复\s*[#＃\[【]?\s*(\d+)\s*[\]】]?\s*[：:]\s*(.+)$/)
+      if (m) {
+        entries.push({ type: 'reply', index: Number(m[1]), comment: m[2].trim() })
+        return
+      }
+      m = text.match(/^评论\s*[：:]\s*(.+)$/)
+      if (m) {
+        entries.push({ type: 'comment', comment: m[1].trim() })
+        return
+      }
+      const last = entries[entries.length - 1]
+      if (last) last.comment += '\n' + text
+    })
+    return entries.filter(e => e.comment)
+  }
+
+  function applyICityNoteResults(ctx, entries) {
+    let count = 0
+    const used = new Set()
+    const updated = updateICityPost(ctx.ownerUid, ctx.post.id, ctx.post.createdAt, item => {
+      entries.forEach(entry => {
+        const comment = resolveICityPromptPlaceholders(entry.comment, ctx).trim()
+        if (!comment) return
+        if (entry.type === 'reply') {
+          const target = ctx.pending[entry.index - 1]
+          if (!target || used.has(String(target.id))) return
+          used.add(String(target.id))
+          item.notes.push(makeICityNote(comment, 'role', ctx.friendName, target.id, ctx.friendId))
+          count += 1
+        } else if (ctx.mode === 'comment' && count < 2) {
+          item.notes.push(makeICityNote(comment, 'role', ctx.friendName, null, ctx.friendId))
+          count += 1
+        }
+      })
+      return item
+    })
+    return { updated, count }
   }
 
   const ICITY_TOP_POPUP_MS = 4200
@@ -755,10 +862,9 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       const prompt = buildICityPrompt(ctx)
       raw = await window.callAI(
         [{ role: 'user', content: prompt.userPrompt }],
-        { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary'), responseFormat: 'json_object' }
+        { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary') }
       )
-      const data = parseICityJSON(raw)
-      applyICityGenerated(ctx, data)
+      applyICityDiary(ctx, cleanICityDiaryText(raw))
       pending?.remove()
       await renderICityHome(page)
       showICityTopMessagePopup({
@@ -770,21 +876,96 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     } catch (e) {
       pending?.remove()
       const msg = e?.message || String(e)
-      let message = msg
-      if (e?.isParseError) {
-        message = '这个模型没有按日记格式返回内容，可以重试，或换一个模型。'
-      } else if (msg.includes('API') || msg.includes('配置') || msg.includes('Base URL') || msg.includes('Key') || msg.includes('模型')) {
-        message = '请先检查设置里的 API 配置。'
-      }
+      const isConfigError = msg.includes('API') || msg.includes('配置') || msg.includes('Base URL') || msg.includes('Key') || msg.includes('模型')
       const rawText = e?.rawOutput || raw
       showICityErrorDialog({
         title: 'iCity 日记生成失败',
-        message,
+        message: isConfigError ? '请先检查设置里的 API 配置。' : msg,
         detail: msg + (rawText ? '\n\n模型原始返回：\n' + String(rawText).slice(0, 2000) : '')
       })
     } finally {
       page._icityGenerating = false
     }
+  }
+
+  // 点“让 TA 回复 / 评论”后：生成小纸条
+  async function runICityNoteReplies(page, detail, post, friendId) {
+    const ownerUid = page?._icityState?.ownerUid
+    if (!ownerUid) return
+    if (!window.callAI) {
+      window.toast?.('请先在设置里配置 API')
+      return
+    }
+    if (page._icityNoting) {
+      window.toast?.('正在生成中，请稍等')
+      return
+    }
+    page._icityNoting = true
+    const btn = detail.querySelector('[data-icity-ai-reply]')
+    const btnHTML = btn?.innerHTML
+    if (btn) {
+      btn.disabled = true
+      btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> TA 正在写…'
+    }
+
+    let raw = ''
+    try {
+      const fresh = findICityPost(ownerUid, post.id, post.createdAt) || post
+      const ctx = await collectICityNoteContext(ownerUid, friendId, fresh)
+      if (ctx.mode === 'none') {
+        window.toast?.('没有需要回复的小纸条')
+        return
+      }
+      const prompt = buildICityNotePrompt(ctx)
+      raw = await window.callAI(
+        [{ role: 'user', content: prompt.userPrompt }],
+        { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary') }
+      )
+      const { updated, count } = applyICityNoteResults(ctx, parseICityNoteLines(raw))
+      if (!count) {
+        const err = new Error('没有从模型的返回里读到可用的回复')
+        err.rawOutput = raw
+        throw err
+      }
+      if (document.body.contains(detail)) await renderICityPostDetailBody(page, detail, updated)
+      await renderICityHome(page)
+      window.toast?.(`${ctx.friendName}留了 ${count} 条小纸条`)
+    } catch (e) {
+      const msg = e?.message || String(e)
+      const isConfigError = msg.includes('API') || msg.includes('配置') || msg.includes('Base URL') || msg.includes('Key')
+      const rawText = e?.rawOutput || raw
+      showICityErrorDialog({
+        title: 'iCity 小纸条回复失败',
+        message: isConfigError ? '请先检查设置里的 API 配置。' : msg,
+        detail: msg + (rawText ? '\n\n模型原始返回：\n' + String(rawText).slice(0, 2000) : '')
+      })
+    } finally {
+      page._icityNoting = false
+      if (btn) {
+        btn.disabled = false
+        btn.innerHTML = btnHTML
+      }
+    }
+  }
+
+  function handleICityAIReply(page, detail, post) {
+    if (post.authorType === 'role' && post.authorId) {
+      runICityNoteReplies(page, detail, post, Number(post.authorId))
+      return
+    }
+    showICityFriendPicker(page, {
+      title: '让谁来回复',
+      onConfirm: (friendId, ui) => {
+        ui.close()
+        runICityNoteReplies(page, detail, post, friendId)
+      }
+    })
+  }
+
+  function icityAIReplyLabel(post) {
+    const hasRoleNote = (post.notes || []).some(n => n.fromType === 'role')
+    const text = post.authorType !== 'role' && !hasRoleNote ? '让 TA 评论' : '让 TA 回复'
+    return `<i class="fa-solid fa-wand-magic-sparkles"></i> ${text}`
   }
 
   // ===== 个人主页（点击底栏头像出现） =====
@@ -1008,6 +1189,9 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
           </div>
         </div>
         ${renderICityNotes(current)}
+                <div class="icity-ai-reply-bar">
+          <button class="icity-ai-reply-btn" type="button" data-icity-ai-reply>${icityAIReplyLabel(current)}</button>
+        </div>
         <div class="icity-detail-actions">
           <button class="icity-detail-action icity-detail-like ${liked ? 'is-liked' : ''}" type="button" data-icity-like>${icityLikeIconHTML(liked)}<span>${liked ? '已喜欢' : '喜欢'}</span></button>
           <span class="icity-detail-divider"></span>
@@ -1033,6 +1217,9 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       })
     })
     bindICityNoteLongPress(page, detail, current)
+        body.querySelector('[data-icity-ai-reply]')?.addEventListener('click', () => {
+      handleICityAIReply(page, detail, current)
+    })
   }
 
   function renderICityNotes(post) {
