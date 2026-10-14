@@ -1,6 +1,6 @@
 // love-diary.js - 恋爱记 (loveDiary) 时间轴
 // 依赖：db.js, main.js (openPage/closePage/toast)；AI 回复需要 window.callAI
-// 入口：window.showloveDiaryPage()
+// 入口：window.showLoveDiaryPage()
 // 数据：db.config 里每对 (ownerUid, charId) 一条，key = loveDiary_{ownerUid}_{charId}
 //       value = { events: [{ id, date:'YYYY-MM-DD', text, authorType:'self'|'role', createdAt, notes:[...] }] }
 
@@ -58,6 +58,14 @@
     ]
   }
 
+  // createdAt 可能是数字，也可能是日期字符串
+  function ldTs(value) {
+    const n = Number(value)
+    if (Number.isFinite(n) && n > 0) return n
+    const t = new Date(value).getTime()
+    return Number.isFinite(t) ? t : 0
+  }
+
   function ldIsDay(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) }
   function ldShortDay(day) { return String(day).replace(/-/g, '.') }
   function ldLongDay(day) {
@@ -66,7 +74,7 @@
   }
 
   // 给以后"日记联动"用：传入时间戳，得到事件应记的日期
-  window.getloveDiaryDay = ldDayOf
+  window.getLoveDiaryDay = ldDayOf
 
   // ===== 数据读写 =====
   function ldKey(ownerUid, charId) { return LD_KEY_PREFIX + ownerUid + '_' + charId }
@@ -175,7 +183,7 @@
   }
 
   // ===== 页面骨架 =====
-  window.showloveDiaryPage = async function() {
+  window.showLoveDiaryPage = async function() {
     if (document.getElementById('love-diary-page')) return
     const page = document.createElement('div')
     page.id = 'love-diary-page'
@@ -344,6 +352,7 @@
     const token = (page._ldTimelineToken || 0) + 1
     page._ldTimelineToken = token
     const events = ldSortEvents(await ldLoad(st.ownerUid, st.charId))
+    const autoOn = await ldAutoEnabled(st.ownerUid, st.charId)
     if (page._ldTimelineToken !== token || page._ld.view !== 'timeline') return
 
     const ch = page._ldChar
@@ -358,6 +367,10 @@
           <span class="ld-person-avatar">${ldAvatarHTML(us.avatar, us.name)}</span>
           <span class="ld-person-name">${ldEsc(us.name)}</span>
         </div>
+      </div>
+      <div class="ld-auto-row">
+        <span class="ld-auto-text">${ldEsc(ch.name)} 写完自己的日记后，可以自己决定要不要在这里记一件事</span>
+        <button class="ld-switch${autoOn ? ' is-on' : ''}" id="ld-auto-switch" type="button" role="switch" aria-checked="${autoOn}"><i></i></button>
       </div>`
 
     if (!events.length) {
@@ -368,6 +381,7 @@
           <div>还没有记录</div>
           <span>点右上角“+”，记下你们的第一件事</span>
         </div>`
+      ldBindAuto(page)
       return
     }
 
@@ -390,13 +404,14 @@
             </div>`
         }).join('')}
       </div>`
+    ldBindAuto(page)
     body.querySelectorAll('.ld-card').forEach(el => {
       el.addEventListener('click', () => ldOpenDetail(page, el.dataset.eventId))
     })
   }
 
   // ===== 新增 / 编辑事件 =====
-  function ldOpenModal(innerHTML, className) {
+  function ldOpenModal(innerHTML, className, sticky) {
     const overlay = document.createElement('div')
     overlay.className = 'sheet-overlay ld-overlay'
     const modal = document.createElement('div')
@@ -417,7 +432,7 @@
         modal.remove()
       }, 220)
     }
-    overlay.addEventListener('click', close)
+    if (!sticky) overlay.addEventListener('click', close)
     return { modal, close }
   }
 
@@ -793,10 +808,10 @@
       }
     }
 
-    const fmtLine = (speaker, content) => {
+    const fmtLine = (speaker, content, tag) => {
       const t = resolve(String(content == null ? '' : content)).replace(/\s+/g, ' ')
       if (!t || /^(data:|blob:)/i.test(t)) return ''
-      return `${speaker}: ${t.slice(0, 200)}`
+      return `${tag || ''}${speaker}: ${t.slice(0, 200)}`
     }
 
     // 线上聊天：事件当天 + 最近
@@ -816,21 +831,31 @@
       .map(m => fmtLine(m.role === 'user' ? userName : friendName, m.content))
       .filter(Boolean)
 
-    // 线下见面：事件当天 + 最近
+    // 线下见面：口径和 iCity 一致（同账号、同聊天、排除 script 模式，去掉 <status>）
     let dayOffline = []
     let recentOffline = []
     try {
-      const rows = (await db.offlineChats.where('charId').equals(charId).toArray())
-        .filter(r => (r.ownerUid == null || Number(r.ownerUid) === Number(ownerUid)) && String(r.content || '').trim())
-        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
-      dayOffline = rows.filter(r => inDay(r.createdAt)).slice(-30)
-      const dayIds = new Set(dayOffline.map(r => r.id))
-      recentOffline = rows.filter(r => !dayIds.has(r.id)).slice(-10)
+      if (chat) {
+        const rows = (await db.offlineChats.where('charId').equals(charId).toArray())
+          .filter(r => Number(r.ownerUid) === Number(ownerUid) &&
+            Number(r.chatId) === Number(chat.id) &&
+            r.mode !== 'script' &&
+            String(r.content || '').trim())
+          .map(r => ({ ...r, _ts: ldTs(r.createdAt) }))
+          .sort((a, b) => a._ts - b._ts)
+        dayOffline = rows.filter(r => inDay(r._ts)).slice(-30)
+        const dayIds = new Set(dayOffline.map(r => r.id))
+        recentOffline = rows.filter(r => !dayIds.has(r.id)).slice(-10)
+      }
     } catch (e) {
       console.warn('[loveDiary] 读取线下见面记录失败：', e)
     }
     const offlineLines = list => list
-      .map(r => fmtLine(r.role === 'user' ? userName : friendName, r.content))
+      .map(r => fmtLine(
+        r.role === 'user' ? userName : friendName,
+        String(r.content || '').replace(/<status>[\s\S]*?<\/status>/gi, '').replace(/\n+/g, ' '),
+        '【线下】'
+      ))
       .filter(Boolean)
 
     // 自动生成的记忆：当天的优先，再补高重要度的
@@ -962,12 +987,148 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     } catch (e) {
       const msg = e?.message || String(e)
       const isConfigError = /API|配置|Base URL|Key|模型/.test(msg)
-      ldToast(isConfigError ? '请先在设置里配置 API' : '生成失败：' + msg.slice(0, 80))
+      ldShowError({
+        title: '恋爱记回复失败',
+        message: isConfigError ? '请先检查设置里的 API 配置。' : msg,
+        detail: msg
+      })
     } finally {
       pendingMap[eventId] = (pendingMap[eventId] || []).filter(p => p.key !== pkey)
       if (document.body.contains(detail)) ldRenderDetail(page, detail)
       if (document.body.contains(page)) ldRenderTimeline(page)
     }
   }
-})()
 
+  // 必须点“我已知晓”才能关闭的报错弹窗（和 iCity 一致）
+  function ldShowError({ title, message, detail }) {
+    if (document.getElementById('ld-error-modal')) return
+    const { modal, close } = ldOpenModal(`
+      <div class="ld-modal-title">${ldEsc(title)}</div>
+      <div class="ld-error-msg">${ldEsc(message)}</div>
+      ${detail ? `<details class="ld-error-detail"><summary>查看更多</summary><pre>${ldEsc(detail)}</pre></details>` : ''}
+      <div class="ld-actions ld-actions-one">
+        <button class="ld-btn-ok" type="button">我已知晓</button>
+      </div>`, 'ld-modal', true)
+    modal.id = 'ld-error-modal'
+    modal.querySelector('.ld-btn-ok').addEventListener('click', close)
+  }
+
+  // ===== 日记联动：角色写完日记后，自己决定要不要记一件事 =====
+  // 由 icity.js 在“日记保存成功”之后调用：
+  //   window.LoveDiary?.afterDiaryGenerated({ ownerUid, charId, diaryText, createdAt })
+  // 约束（防止被逼着写纪念日 / 一次生成一大串）：
+  //   · 默认回答“无”，大多数日子不记
+  //   · 一次最多记 1 件；同一天角色最多自己记 1 件
+  //   · 只记已发生、两人都参与的事；计划、感想、纪念日不算
+  //   · 开关可在时间轴顶部关掉（按每个角色单独存）
+  async function ldAutoEnabled(ownerUid, charId) {
+    const row = await db.config.get(`loveDiaryAuto_${ownerUid}_${charId}`)
+    return row?.value !== false
+  }
+
+  function ldBindAuto(page) {
+    const btn = page.querySelector('#ld-auto-switch')
+    if (!btn) return
+    btn.addEventListener('click', async () => {
+      const st = page._ld
+      if (!st || !st.ownerUid || !st.charId) return
+      const next = !btn.classList.contains('is-on')
+      await db.config.put({ key: `loveDiaryAuto_${st.ownerUid}_${st.charId}`, value: next })
+      btn.classList.toggle('is-on', next)
+      btn.setAttribute('aria-checked', String(next))
+    })
+  }
+
+  function ldShiftDay(day, n) {
+    const [y, m, d] = String(day).split('-').map(Number)
+    const t = new Date(y, m - 1, d - n)
+    return `${t.getFullYear()}-${pad2(t.getMonth() + 1)}-${pad2(t.getDate())}`
+  }
+
+  async function ldAfterDiary(opts) {
+    try {
+      const ownerUid = Number(opts?.ownerUid)
+      const charId = Number(opts?.charId)
+      const diaryText = String(opts?.diaryText || '').trim()
+      if (!ownerUid || !charId || diaryText.length < 20) return
+      if (!window.callAI) return
+      if (!(await ldAutoEnabled(ownerUid, charId))) return
+
+      const ts = Number(opts?.createdAt) || Date.now()
+      const today = ldDayOf(ts)
+      const events = await ldLoad(ownerUid, charId)
+      // 同一天角色最多自己记一件，已经记过就不再调用 AI
+      if (events.some(e => e.authorType === 'role' && ldDayOf(e.createdAt) === today)) return
+
+      const ctx = await ldCollectContext(ownerUid, charId, { date: today, text: '', notes: [], authorType: 'role' })
+      const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
+${ctx.persona || '暂无额外设定。'}
+${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
+你刚写完今天的日记。你和「${ctx.userName}」一起维护着一本“恋爱记”，只记你们两个人之间真正发生过、值得留下的事，例如：第一次一起做某件事、一次难忘的见面、一场重要的对话、一个约定的达成。
+大多数日子并没有值得记的事，这时只回复“无”就好，不要为了记而记。
+规则：
+· 只记已经发生、并且你和「${ctx.userName}」都参与了的事。计划、打算、心情、感想都不算。
+· 不要因为是纪念日、周年、节日就记，除非那天你们真的一起做了什么。
+· 不要重复恋爱记里已经有的事。
+· 最多只记一件，写成一句话，30 字以内，用你自己的口吻，可以用“我们”。
+· 发生的日子如果不是今天，请写出是几天前（0 表示今天，最多 7）。
+· 只输出一行，格式严格如下，不要任何解释：
+  无
+  或
+  记｜几天前的数字｜这件事
+· 不要输出任何双花括号包裹的模板占位符。`
+
+      const parts = [`【你今天的日记】\n${ctx.resolve(diaryText).slice(0, 2500)}`]
+      const recentEvents = ldSortEvents(events).slice(0, 8)
+      if (recentEvents.length) {
+        parts.push('【恋爱记里已有的事（最近）】\n' + recentEvents.map(e =>
+          `- ${e.date} ${e.authorType === 'role' ? ctx.friendName : ctx.userName}：${ctx.resolve(e.text)}`
+        ).join('\n'))
+      }
+      const refs = []
+      if (ctx.dayChat.length) refs.push(`【今天的线上聊天】\n${ctx.dayChat.join('\n')}`)
+      if (ctx.dayOffline.length) refs.push(`【今天的线下见面】\n${ctx.dayOffline.join('\n')}`)
+      if (ctx.memLines.length) refs.push(`【相关记忆】\n${ctx.memLines.join('\n')}`)
+      if (ctx.recentChat.length) refs.push(`【最近的线上聊天】\n${ctx.recentChat.join('\n')}`)
+      if (ctx.recentOffline.length) refs.push(`【最近的线下见面】\n${ctx.recentOffline.join('\n')}`)
+      if (refs.length) parts.push('以下是用来核对“事情是否真的发生过”的背景：\n\n' + refs.join('\n\n'))
+      parts.push('现在判断：今天有没有一件值得记进恋爱记的事？')
+
+      const callOpts = { system: systemPrompt }
+      if (window.getAITemperaturePreset) {
+        const temp = await window.getAITemperaturePreset('icityDiary')
+        if (temp !== undefined && temp !== null) callOpts.temperature = temp
+      }
+      const raw = await window.callAI([{ role: 'user', content: parts.join('\n\n') }], callOpts)
+      const answer = String(raw == null ? '' : raw).replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+      const firstLine = answer.split('\n').map(s => s.trim()).find(Boolean) || ''
+      const m = firstLine.match(/^记\s*[｜|]\s*(\d+)\s*[｜|]\s*(.+)$/)
+      if (!m) return   // “无”或格式不对，一律当作不记
+
+      const daysAgo = Math.min(7, Math.max(0, parseInt(m[1], 10) || 0))
+      const date = ldShiftDay(today, daysAgo)
+      const text = ldResolvePlaceholders(m[2], ctx).replace(/^["“「『]+|["”」』]+$/g, '').trim().slice(0, 60)
+      if (!text) return
+
+      await ldUpdate(ownerUid, charId, list => {
+        if (list.some(e => e.date === date && e.text === text)) return
+        if (list.some(e => e.authorType === 'role' && ldDayOf(e.createdAt) === today)) return
+        list.push({
+          id: ldMakeId('ev'),
+          date,
+          text,
+          authorType: 'role',
+          createdAt: Date.now(),
+          notes: []
+        })
+      })
+    } catch (e) {
+      console.warn('[loveDiary] 日记联动失败：', e)
+    }
+  }
+
+  window.LoveDiary = {
+    afterDiaryGenerated: ldAfterDiary,
+    dayOf: ldDayOf
+  }
+})()
