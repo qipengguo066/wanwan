@@ -772,8 +772,9 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       err.rawOutput = text
       throw err
     }
+
     const posts = loadICityPosts(ctx.ownerUid)
-    posts.unshift({
+    const newPost = {
       id: makeICityId('post'),
       text: diary,
       createdAt: Date.now(),
@@ -781,8 +782,10 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       authorId: ctx.friendId,
       liked: false,
       notes: []
-    })
+    }
+    posts.unshift(newPost)
     saveICityPosts(ctx.ownerUid, posts)
+    return newPost
   }
 
   function parseICityNoteLines(raw) {
@@ -893,7 +896,8 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
         [{ role: 'user', content: prompt.userPrompt }],
         { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary') }
       )
-      applyICityDiary(ctx, cleanICityDiaryText(raw))
+            const newPost = applyICityDiary(ctx, cleanICityDiaryText(raw))
+      window.LoveDiary?.afterDiaryGenerated({ ownerUid: ctx.ownerUid, charId: ctx.friendId, diaryText: newPost.text, createdAt: newPost.createdAt })
       pending?.remove()
       await renderICityHome(page)
       showICityTopMessagePopup({
