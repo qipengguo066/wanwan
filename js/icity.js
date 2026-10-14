@@ -545,7 +545,7 @@
     const posts = loadICityPosts(ownerUid)
     const previousRolePost = posts.find(p => p.authorType === 'role' && Number(p.authorId) === Number(friendId)) || null
     const sinceTs = previousRolePost ? previousRolePost.createdAt : 0
-    const recent = await loadICityChatSince(base, sinceTs, sinceTs ? ICITY_CHAT_LIMIT_SINCE : ICITY_CHAT_LIMIT_FIRST), ICITY_CHAT_CHAR_BUDGET
+    const recent = await loadICityChatSince(base, sinceTs, sinceTs ? ICITY_CHAT_LIMIT_SINCE : ICITY_CHAT_LIMIT_FIRST, ICITY_CHAT_CHAR_BUDGET)
     const previousDiary = previousRolePost
       ? resolveICityPromptPlaceholders(previousRolePost.text, base).trim().slice(0, 600)
       : ''
@@ -586,7 +586,7 @@
       return `${tag}${head}：${resolveICityPromptPlaceholders(n.comment, base).trim()}`
     }).join('\n')
 
-    const recent = await loadICityChatSince(base, 0, ICITY_NOTE_CHAT_LIMIT), ICITY_NOTE_CHAR_BUDGET
+      const recent = await loadICityChatSince(base, 0, ICITY_NOTE_CHAT_LIMIT, ICITY_NOTE_CHAR_BUDGET)
     return {
       ...base,
       post,
