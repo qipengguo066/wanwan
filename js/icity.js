@@ -427,7 +427,9 @@
 
   // ===== 日记 / 小纸条：读取资料 =====
   const ICITY_CHAT_LIMIT_FIRST = 30   // 第一次生成（还没有日记）最多读多少条聊天
-  const ICITY_CHAT_LIMIT_SINCE = 150  // 上次日记之后最多读多少条聊天
+    const ICITY_CHAT_LIMIT_SINCE = 400      // 上次日记之后最多读多少条（线上+线下合计）
+  const ICITY_CHAT_CHAR_BUDGET = 10000    // 上次日记之后最多读多少字（越大覆盖越多，也越费钱）
+  const ICITY_NOTE_CHAR_BUDGET = 3000     // 回复小纸条时参考聊天的字数上限
   const ICITY_NOTE_CHAT_LIMIT = 10    // 回复小纸条时参考的最近聊天条数
   const ICITY_DAY_START_HOUR = 5      // 凌晨几点之前算前一天（改成 0 就是严格按自然日）
 
@@ -457,7 +459,8 @@
         lines.push(`【${day}】`)
         lastDay = day
       }
-      lines.push(`${item.ts ? icityTimeLabel(item.ts) + ' ' : ''}${item.speaker}: ${item.text}`)
+      const tag = item.source === 'offline' ? '【线下】' : ''
+      lines.push(`${item.ts ? icityTimeLabel(item.ts) + ' ' : ''}${tag}${item.speaker}: ${item.text}`)
     })
     return lines.join('\n')
   }
@@ -494,20 +497,46 @@
     return { ownerUid, friendId, userName, charName, friendName, friendAvatar, persona, charRole, loreText }
   }
 
-  async function loadICityChatSince(base, sinceTs, limit) {
+    // 从最新往回取，直到条数或字数用完，再恢复成时间顺序
+  function pickICityRecent(items, limit, charBudget) {
+    const picked = []
+    let used = 0
+    for (let i = items.length - 1; i >= 0 && picked.length < limit; i--) {
+      const len = items[i].text.length
+      if (picked.length && used + len > charBudget) break
+      picked.push(items[i])
+      used += len
+    }
+    return picked.reverse()
+  }
+
+  // 线上聊天 + 线下见面，合并成一条时间线
+  async function loadICityChatSince(base, sinceTs, limit, charBudget) {
+    const items = []
     const chat = await db.chats.where('[ownerUid+charId]').equals([base.ownerUid, base.friendId]).first()
-    if (!chat) return []
-    const msgs = await db.messages.where('chatId').equals(chat.id).sortBy('createdAt')
-    return msgs
-      .map(m => ({ ts: icityTs(m.createdAt), role: m.role, content: m.content }))
+    if (chat) {
+      const msgs = await db.messages.where('chatId').equals(chat.id).toArray()
+      msgs.forEach(m => items.push({ ts: icityTs(m.createdAt), source: 'online', role: m.role, content: m.content }))
+      const offline = await db.offlineChats.where('charId').equals(base.friendId).toArray()
+      offline
+        .filter(m => Number(m.ownerUid) === Number(base.ownerUid) && Number(m.chatId) === Number(chat.id) && m.mode !== 'script')
+        .forEach(m => items.push({ ts: icityTs(m.createdAt), source: 'offline', role: m.role, content: m.content }))
+    }
+    const list = items
       .filter(m => !sinceTs || m.ts > sinceTs)
-      .slice(-limit)
-      .map(m => ({
-        ts: m.ts,
-        speaker: m.role === 'user' ? base.userName : base.friendName,
-        text: resolveICityPromptPlaceholders(m.content, base).trim()
-      }))
+      .sort((a, b) => a.ts - b.ts)
+      .map(m => {
+        let text = resolveICityPromptPlaceholders(m.content, base)
+        if (m.source === 'offline') text = text.replace(/<status>[\s\S]*?<\/status>/gi, '').replace(/\n+/g, ' ')
+        return {
+          ts: m.ts,
+          source: m.source,
+          speaker: m.role === 'user' ? base.userName : base.friendName,
+          text: text.trim()
+        }
+      })
       .filter(x => x.text)
+    return pickICityRecent(list, limit, charBudget)
   }
 
   // 写日记：读取该角色上一篇日记之后的聊天
@@ -516,7 +545,7 @@
     const posts = loadICityPosts(ownerUid)
     const previousRolePost = posts.find(p => p.authorType === 'role' && Number(p.authorId) === Number(friendId)) || null
     const sinceTs = previousRolePost ? previousRolePost.createdAt : 0
-    const recent = await loadICityChatSince(base, sinceTs, sinceTs ? ICITY_CHAT_LIMIT_SINCE : ICITY_CHAT_LIMIT_FIRST)
+    const recent = await loadICityChatSince(base, sinceTs, sinceTs ? ICITY_CHAT_LIMIT_SINCE : ICITY_CHAT_LIMIT_FIRST), ICITY_CHAT_CHAR_BUDGET
     const previousDiary = previousRolePost
       ? resolveICityPromptPlaceholders(previousRolePost.text, base).trim().slice(0, 600)
       : ''
@@ -557,7 +586,7 @@
       return `${tag}${head}：${resolveICityPromptPlaceholders(n.comment, base).trim()}`
     }).join('\n')
 
-    const recent = await loadICityChatSince(base, 0, ICITY_NOTE_CHAT_LIMIT)
+    const recent = await loadICityChatSince(base, 0, ICITY_NOTE_CHAT_LIMIT), ICITY_NOTE_CHAR_BUDGET
     return {
       ...base,
       post,
@@ -591,7 +620,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     }
     if (ctx.recent.length) {
       const dayRule = ICITY_DAY_START_HOUR > 0 ? `，凌晨 ${ICITY_DAY_START_HOUR} 点前的消息算前一天` : ''
-      parts.push(`【自上一篇日记以来，你和${ctx.userName}的聊天】（按日期排列${dayRule}；仅作灵感，别照搬聊天原文，要转成日记口吻写感受）：\n${formatICityChatForPrompt(ctx.recent)}`)
+      parts.push(`【自上一篇日记以来，你和${ctx.userName}的聊天和线下见面记录】（标有【线下】的是线下见面时的叙述记录；按日期排列${dayRule}；仅作灵感，别照搬聊天原文，要转成日记口吻写感受）：\n${formatICityChatForPrompt(ctx.recent)}`)
     } else {
       parts.push('【近况】这段时间你们没有新的聊天。可以写写你自己的日常和心情，不要编造你们之间发生过的事。')
     }
