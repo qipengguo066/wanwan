@@ -1,1 +1,973 @@
+// love-diary.js - 恋爱记 (loveDiary) 时间轴
+// 依赖：db.js, main.js (openPage/closePage/toast)；AI 回复需要 window.callAI
+// 入口：window.showloveDiaryPage()
+// 数据：db.config 里每对 (ownerUid, charId) 一条，key = loveDiary_{ownerUid}_{charId}
+//       value = { events: [{ id, date:'YYYY-MM-DD', text, authorType:'self'|'role', createdAt, notes:[...] }] }
+
+(function() {
+  const LD_KEY_PREFIX = 'loveDiary_'
+  const LD_DAY_START_HOUR = 5      // 凌晨 5 点前算前一天
+  const LD_SORT_DESC = true        // true：新的在上；false：旧的在上
+  const LD_MAX_EVENT_LEN = 300
+  const ldLocks = {}
+
+  // ===== 通用小工具 =====
+  function pad2(n) { return n < 10 ? '0' + n : String(n) }
+
+  function ldEsc(str) {
+    if (str === null || str === undefined) return ''
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+  }
+
+  function ldInitial(name) {
+    return String(name || '?').trim().charAt(0) || '?'
+  }
+
+  function ldAvatarHTML(src, name) {
+    return src
+      ? `<img src="${ldEsc(src)}" alt="${ldEsc(name)}">`
+      : `<span>${ldEsc(ldInitial(name))}</span>`
+  }
+
+  function ldMakeId(prefix) {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  }
+
+  function ldToast(msg) {
+    if (window.toast) window.toast(msg)
+  }
+
+  // ===== 日期：只记年月日，凌晨 5 点前算前一天 =====
+  function ldDayOf(ts) {
+    const d = new Date(ts)
+    if (d.getHours() < LD_DAY_START_HOUR) d.setDate(d.getDate() - 1)
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+  }
+
+  // 某一天对应的时间区间：当天 5:00 ~ 次日 5:00
+  function ldDayRange(day) {
+    const [y, m, d] = String(day).split('-').map(Number)
+    return [
+      new Date(y, m - 1, d, LD_DAY_START_HOUR, 0, 0, 0).getTime(),
+      new Date(y, m - 1, d + 1, LD_DAY_START_HOUR, 0, 0, 0).getTime()
+    ]
+  }
+
+  function ldIsDay(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) }
+  function ldShortDay(day) { return String(day).replace(/-/g, '.') }
+  function ldLongDay(day) {
+    const [y, m, d] = String(day).split('-').map(Number)
+    return `${y}年${m}月${d}日`
+  }
+
+  // 给以后"日记联动"用：传入时间戳，得到事件应记的日期
+  window.getloveDiaryDay = ldDayOf
+
+  // ===== 数据读写 =====
+  function ldKey(ownerUid, charId) { return LD_KEY_PREFIX + ownerUid + '_' + charId }
+
+  function ldNormalizeEvents(list) {
+    if (!Array.isArray(list)) return []
+    return list
+      .map(ev => {
+        const createdAt = Number(ev?.createdAt) || Date.now()
+        const notes = Array.isArray(ev?.notes) ? ev.notes : []
+        return {
+          id: ev?.id || ldMakeId('ev'),
+          date: ldIsDay(ev?.date) ? ev.date : ldDayOf(createdAt),
+          text: String(ev?.text || '').trim(),
+          authorType: ev?.authorType === 'role' ? 'role' : 'self',
+          createdAt,
+          notes: notes
+            .map(n => {
+              const nCreatedAt = Number(n?.createdAt) || Date.now()
+              return {
+                id: n?.id || ldMakeId('note'),
+                comment: String(n?.comment || '').trim(),
+                fromType: n?.fromType === 'role' ? 'role' : 'self',
+                fromName: String(n?.fromName || '').trim(),
+                fromId: n?.fromId ?? null,
+                replyToId: n?.replyToId || null,
+                createdAt: nCreatedAt
+              }
+            })
+            .filter(n => n.comment)
+            .sort((a, b) => a.createdAt - b.createdAt)
+        }
+      })
+      .filter(ev => ev.text)
+  }
+
+  async function ldLoad(ownerUid, charId) {
+    const row = await db.config.get(ldKey(ownerUid, charId))
+    return ldNormalizeEvents(row?.value?.events)
+  }
+
+  // 读-改-写串行执行，避免"AI 回复回来"和"用户新增备注"互相覆盖
+  function ldUpdate(ownerUid, charId, mutator) {
+    const k = ldKey(ownerUid, charId)
+    const run = (ldLocks[k] || Promise.resolve()).then(async () => {
+      const events = await ldLoad(ownerUid, charId)
+      await mutator(events)
+      const next = ldNormalizeEvents(events)
+      await db.config.put({ key: k, value: { events: next } })
+      return next
+    })
+    ldLocks[k] = run.catch(() => {})
+    return run
+  }
+
+  function ldSortEvents(events) {
+    const arr = events.slice().sort((a, b) => a.date.localeCompare(b.date) || a.createdAt - b.createdAt)
+    return LD_SORT_DESC ? arr.reverse() : arr
+  }
+
+  function ldMakeNote(comment, fromType, fromName, replyToId, fromId) {
+    return {
+      id: ldMakeId('note'),
+      comment: String(comment || '').trim(),
+      fromType,
+      fromName,
+      fromId: fromId ?? null,
+      replyToId: replyToId || null,
+      createdAt: Date.now()
+    }
+  }
+
+  // ===== 账号 / 好友资料 =====
+  async function ldSelfProfile(uid) {
+    if (!uid) return {}
+    const row = await db.config.get(`wechatSelfProfile_${uid}`)
+    return row?.value || {}
+  }
+
+  async function ldFriendProfile(ownerUid, charId) {
+    if (!ownerUid || !charId) return {}
+    const row = await db.config.get(`wechatProfile_${ownerUid}_${charId}`)
+    return row?.value || {}
+  }
+
+  function ldCharDisplayName(char, profile) {
+    return (profile?.remark || '').trim() || char?.nick || char?.name || '未知'
+  }
+
+  async function ldLoadFriends(ownerUid) {
+    const cfg = await db.config.get(`friends_${ownerUid}`)
+    const ids = Array.isArray(cfg?.value) ? cfg.value : []
+    if (!ids.length) return []
+    const rows = await Promise.all(ids.map(async id => {
+      const char = await db.characters.get(parseInt(id, 10))
+      if (!char || char.type === 'user') return null
+      const profile = await ldFriendProfile(ownerUid, char.id)
+      return {
+        id: char.id,
+        name: ldCharDisplayName(char, profile),
+        avatar: profile?.avatar || char.avatar || '',
+        count: (await ldLoad(ownerUid, char.id)).length
+      }
+    }))
+    return rows.filter(Boolean).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  }
+
+  // ===== 页面骨架 =====
+  window.showloveDiaryPage = async function() {
+    if (document.getElementById('love-diary-page')) return
+    const page = document.createElement('div')
+    page.id = 'love-diary-page'
+    page.className = 'full-page miss-page ld-page'
+    page.innerHTML = `
+      <div class="page-header miss-header">
+        <button class="header-back" id="ld-back" type="button"><i class="fa fa-angle-left"></i></button>
+        <span class="header-title" id="ld-title">恋爱记</span>
+        <button class="ld-header-action" id="ld-add" type="button" aria-label="新增事件" hidden>
+          <i class="fa-solid fa-plus"></i>
+        </button>
+      </div>
+      <div class="miss-body" id="ld-body"></div>
+    `
+    page._ld = { view: 'accounts', multiOwner: true }
+    page._ldPending = {}
+    page.querySelector('#ld-back').addEventListener('click', () => ldHandleBack(page))
+    page.querySelector('#ld-add').addEventListener('click', () => ldOpenEditor(page, null))
+    window.openPage(page)
+    await ldShowAccounts(page)
+  }
+
+  function ldSetTitle(page, title) {
+    const el = page.querySelector('#ld-title')
+    if (el) el.textContent = title
+  }
+
+  function ldSetAddVisible(page, visible) {
+    const btn = page.querySelector('#ld-add')
+    if (btn) btn.hidden = !visible
+  }
+
+  function ldHandleBack(page) {
+    const st = page._ld || {}
+    if (st.view === 'timeline') {
+      ldShowRoles(page, st.ownerUid)
+      return
+    }
+    if (st.view === 'roles' && st.multiOwner) {
+      ldShowAccounts(page)
+      return
+    }
+    window.closePage('love-diary-page')
+  }
+
+  async function ldShowAccounts(page) {
+    page._ld = { view: 'accounts', multiOwner: true }
+    ldSetTitle(page, '恋爱记')
+    ldSetAddVisible(page, false)
+    const body = page.querySelector('#ld-body')
+    body.innerHTML = '<div class="miss-loading"><i class="fa fa-spinner fa-spin"></i></div>'
+
+    const users = (await db.characters.where('type').equals('user').toArray())
+      .sort((a, b) => (b.id || 0) - (a.id || 0))
+    if (!users.length) {
+      body.innerHTML = `
+        <div class="miss-empty">
+          <i class="fa fa-user"></i>
+          <div>暂无微信账号</div>
+          <span>请先在微信里登录或创建 USER 角色</span>
+        </div>`
+      return
+    }
+    if (users.length === 1) {
+      await ldShowRoles(page, users[0].id, false)
+      return
+    }
+    const items = []
+    for (const user of users) {
+      const profile = await ldSelfProfile(user.id)
+      items.push({
+        user,
+        name: user.nick || user.name || '我',
+        avatar: profile.avatar || user.avatar || ''
+      })
+    }
+    body.innerHTML = `
+      <div class="miss-section-title">选择微信账号</div>
+      <div class="miss-list">
+        ${items.map(it => `
+          <button class="miss-row" data-owner-uid="${it.user.id}" type="button">
+            <div class="miss-avatar">${ldAvatarHTML(it.avatar, it.name)}</div>
+            <div class="miss-row-main">
+              <div class="miss-row-title">${ldEsc(it.name)}</div>
+              <div class="miss-row-sub">${ldEsc(it.user.identity?.account ? '@' + it.user.identity.account : '微信账号')}</div>
+            </div>
+            <i class="fa fa-angle-right"></i>
+          </button>`).join('')}
+      </div>`
+    body.querySelectorAll('.miss-row').forEach(row => {
+      row.addEventListener('click', () => ldShowRoles(page, parseInt(row.dataset.ownerUid, 10), true))
+    })
+  }
+
+  async function ldShowRoles(page, ownerUid, multiOwner) {
+    const prevMulti = page._ld?.multiOwner
+    page._ld = {
+      view: 'roles',
+      ownerUid,
+      multiOwner: multiOwner === undefined ? prevMulti : multiOwner
+    }
+    ldSetTitle(page, '恋爱记')
+    ldSetAddVisible(page, false)
+    const body = page.querySelector('#ld-body')
+    body.innerHTML = '<div class="miss-loading"><i class="fa fa-spinner fa-spin"></i></div>'
+    const friends = await ldLoadFriends(ownerUid)
+    if (page._ld.view !== 'roles' || page._ld.ownerUid !== ownerUid) return
+    if (!friends.length) {
+      body.innerHTML = `
+        <div class="miss-empty">
+          <i class="fa fa-heart"></i>
+          <div>暂无好友</div>
+          <span>当前微信号还没有添加好友</span>
+        </div>`
+      return
+    }
+    body.innerHTML = `
+      <div class="miss-section-title">选择想翻开的人</div>
+      <div class="miss-list">
+        ${friends.map(f => `
+          <button class="miss-row" data-char-id="${f.id}" type="button">
+            <div class="miss-avatar">${ldAvatarHTML(f.avatar, f.name)}</div>
+            <div class="miss-row-main">
+              <div class="miss-row-title">${ldEsc(f.name)}</div>
+              <div class="miss-row-sub">${f.count ? f.count + ' 件事' : '还没有记录'}</div>
+            </div>
+            <i class="fa fa-angle-right"></i>
+          </button>`).join('')}
+      </div>`
+    body.querySelectorAll('.miss-row').forEach(row => {
+      row.addEventListener('click', () => ldShowTimeline(page, ownerUid, parseInt(row.dataset.charId, 10)))
+    })
+  }
+
+  async function ldShowTimeline(page, ownerUid, charId) {
+    const char = await db.characters.get(charId)
+    const owner = await db.characters.get(ownerUid)
+    if (!char || !owner) {
+      ldToast('角色不存在')
+      return
+    }
+    const cProfile = await ldFriendProfile(ownerUid, charId)
+    const uProfile = await ldSelfProfile(ownerUid)
+    page._ldChar = {
+      id: charId,
+      name: ldCharDisplayName(char, cProfile),
+      avatar: cProfile?.avatar || char.avatar || ''
+    }
+    page._ldUser = {
+      id: ownerUid,
+      name: owner.nick || owner.name || '我',
+      avatar: uProfile.avatar || owner.avatar || ''
+    }
+    page._ld = { view: 'timeline', ownerUid, charId, multiOwner: page._ld?.multiOwner }
+    ldSetTitle(page, '恋爱记')
+    ldSetAddVisible(page, true)
+    await ldRenderTimeline(page)
+  }
+
+  // ===== 时间轴 =====
+  async function ldRenderTimeline(page) {
+    const st = page._ld
+    if (!st || st.view !== 'timeline') return
+    const body = page.querySelector('#ld-body')
+    if (!body) return
+    const token = (page._ldTimelineToken || 0) + 1
+    page._ldTimelineToken = token
+    const events = ldSortEvents(await ldLoad(st.ownerUid, st.charId))
+    if (page._ldTimelineToken !== token || page._ld.view !== 'timeline') return
+
+    const ch = page._ldChar
+    const us = page._ldUser
+    const people = `
+      <div class="ld-people">
+        <div class="ld-person">
+          <span class="ld-person-avatar">${ldAvatarHTML(ch.avatar, ch.name)}</span>
+          <span class="ld-person-name">${ldEsc(ch.name)}</span>
+        </div>
+        <div class="ld-person">
+          <span class="ld-person-avatar">${ldAvatarHTML(us.avatar, us.name)}</span>
+          <span class="ld-person-name">${ldEsc(us.name)}</span>
+        </div>
+      </div>`
+
+    if (!events.length) {
+      body.innerHTML = `
+        ${people}
+        <div class="miss-empty ld-empty">
+          <i class="fa fa-heart"></i>
+          <div>还没有记录</div>
+          <span>点右上角“+”，记下你们的第一件事</span>
+        </div>`
+      return
+    }
+
+    body.innerHTML = `
+      ${people}
+      <div class="ld-timeline">
+        ${events.map(ev => {
+          const isRole = ev.authorType === 'role'
+          const card = `
+            <div class="ld-card" data-event-id="${ldEsc(ev.id)}">
+              <div class="ld-card-date">${ldEsc(ldShortDay(ev.date))}</div>
+              <div class="ld-card-text">${ldEsc(ev.text).replace(/\n/g, '<br>')}</div>
+              ${ev.notes.length ? `<div class="ld-card-foot"><i class="fa-regular fa-note-sticky"></i> ${ev.notes.length}</div>` : ''}
+            </div>`
+          return `
+            <div class="ld-item ${isRole ? 'ld-left' : 'ld-right'}">
+              <div class="ld-side ld-side-left">${isRole ? card : ''}</div>
+              <div class="ld-dot"></div>
+              <div class="ld-side ld-side-right">${isRole ? '' : card}</div>
+            </div>`
+        }).join('')}
+      </div>`
+    body.querySelectorAll('.ld-card').forEach(el => {
+      el.addEventListener('click', () => ldOpenDetail(page, el.dataset.eventId))
+    })
+  }
+
+  // ===== 新增 / 编辑事件 =====
+  function ldOpenModal(innerHTML, className) {
+    const overlay = document.createElement('div')
+    overlay.className = 'sheet-overlay ld-overlay'
+    const modal = document.createElement('div')
+    modal.className = 'center-modal ' + className
+    modal.innerHTML = innerHTML
+    const app = document.getElementById('app') || document.body
+    app.appendChild(overlay)
+    app.appendChild(modal)
+    requestAnimationFrame(() => {
+      overlay.classList.add('show')
+      modal.classList.add('show')
+    })
+    const close = () => {
+      overlay.classList.remove('show')
+      modal.classList.remove('show')
+      setTimeout(() => {
+        overlay.remove()
+        modal.remove()
+      }, 220)
+    }
+    overlay.addEventListener('click', close)
+    return { modal, close }
+  }
+
+  function ldOpenEditor(page, ev, detail) {
+    if (document.getElementById('ld-editor-modal')) return
+    const st = page._ld
+    if (!st || !st.ownerUid || !st.charId) return
+    const isEdit = !!ev
+    const { modal, close } = ldOpenModal(`
+      <div class="ld-modal-title">${isEdit ? '编辑事件' : '记一件事'}</div>
+      <label class="ld-field-label">日期</label>
+      <input class="ld-date-input" id="ld-edit-date" type="date" value="${ldEsc(ev ? ev.date : ldDayOf(Date.now()))}">
+      <div class="ld-field-hint">只记年月日。默认取“今天”，凌晨 5 点前算前一天；事情发生在别的日子，请手动改。</div>
+      <label class="ld-field-label">发生了什么</label>
+      <textarea class="ld-text-input" id="ld-edit-text" maxlength="${LD_MAX_EVENT_LEN}" placeholder="例如：第一次一起看海">${ldEsc(ev ? ev.text : '')}</textarea>
+      <div class="ld-actions">
+        <button class="ld-btn-cancel" type="button">取消</button>
+        <button class="ld-btn-ok" id="ld-edit-save" type="button">保存</button>
+      </div>`, 'ld-modal')
+    modal.id = 'ld-editor-modal'
+    const dateInput = modal.querySelector('#ld-edit-date')
+    const textInput = modal.querySelector('#ld-edit-text')
+    modal.querySelector('.ld-btn-cancel').addEventListener('click', close)
+    setTimeout(() => { if (!isEdit) textInput.focus() }, 260)
+    modal.querySelector('#ld-edit-save').addEventListener('click', async () => {
+      const date = dateInput.value
+      const text = textInput.value.trim()
+      if (!ldIsDay(date)) { ldToast('请选择日期'); return }
+      if (!text) { ldToast('请写点什么'); return }
+      close()
+      await ldUpdate(st.ownerUid, st.charId, events => {
+        if (isEdit) {
+          const target = events.find(e => e.id === ev.id)
+          if (target) { target.date = date; target.text = text }
+        } else {
+          events.push({
+            id: ldMakeId('ev'),
+            date,
+            text,
+            authorType: 'self',
+            createdAt: Date.now(),
+            notes: []
+          })
+        }
+      })
+      await ldRenderTimeline(page)
+      if (detail && document.body.contains(detail)) ldRenderDetail(page, detail)
+    })
+  }
+
+  // ===== 详情页（事件 + 备注） =====
+  async function ldOpenDetail(page, eventId) {
+    if (document.getElementById('love-diary-detail')) return
+    const detail = document.createElement('div')
+    detail.id = 'love-diary-detail'
+    detail.className = 'full-page miss-page ld-page ld-detail-page'
+    detail.innerHTML = `
+      <div class="page-header miss-header">
+        <button class="header-back" id="ld-detail-back" type="button"><i class="fa fa-angle-left"></i></button>
+        <span class="header-title">恋爱记·详情</span>
+        <span class="ld-header-spacer"></span>
+      </div>
+      <div class="miss-body ld-detail-body" id="ld-detail-body"></div>
+    `
+    detail._ldEventId = eventId
+    window.openPage(detail)
+    detail.querySelector('#ld-detail-back').addEventListener('click', () => {
+      window.closePage('love-diary-detail')
+      ldRenderTimeline(page)
+    })
+    await ldRenderDetail(page, detail)
+  }
+
+  function ldNameOf(page, type) {
+    return type === 'role' ? page._ldChar.name : page._ldUser.name
+  }
+
+  async function ldRenderDetail(page, detail) {
+    const st = page._ld
+    const body = detail.querySelector('#ld-detail-body')
+    if (!body || !st) return
+    const token = (detail._ldToken || 0) + 1
+    detail._ldToken = token
+    const events = await ldLoad(st.ownerUid, st.charId)
+    if (!document.body.contains(detail) || detail._ldToken !== token) return
+    const ev = events.find(e => e.id === detail._ldEventId)
+    if (!ev) {
+      window.closePage('love-diary-detail')
+      ldRenderTimeline(page)
+      return
+    }
+    const author = ev.authorType === 'role' ? page._ldChar : page._ldUser
+    const pending = (page._ldPending[ev.id] || [])
+    const notesById = new Map(ev.notes.map(n => [String(n.id), n]))
+    const answered = new Set(
+      ev.notes.filter(n => n.fromType === 'role' && n.replyToId).map(n => String(n.replyToId))
+    )
+    const pendingKeys = new Set(pending.map(p => p.key))
+
+    const noteHTML = note => {
+      const name = ldNameOf(page, note.fromType)
+      const parent = note.replyToId ? notesById.get(String(note.replyToId)) : null
+      const meta = parent
+        ? `${ldEsc(name)} <span class="ld-note-reply-word">回复</span> ${ldEsc(ldNameOf(page, parent.fromType))}：${ldEsc(parent.comment)}`
+        : ldEsc(name)
+      const canAsk = note.fromType === 'self' && !answered.has(String(note.id)) && !pendingKeys.has(String(note.id))
+      return `
+        <div class="ld-note" data-ld-note-id="${ldEsc(note.id)}">
+          <div class="ld-note-main">
+            <div class="ld-note-meta">
+              <span>${meta}</span>
+              <span class="ld-note-btns">
+                ${canAsk ? `<button type="button" data-ld-ai-reply="${ldEsc(note.id)}">让 TA 回复</button>` : ''}
+                <button type="button" data-ld-reply-note="${ldEsc(note.id)}">回复</button>
+              </span>
+            </div>
+            <div class="ld-note-comment">${ldEsc(note.comment)}</div>
+          </div>
+          <div class="ld-note-action-menu" aria-hidden="true">
+            <button type="button" data-ld-note-action="copy">复制</button>
+            <button type="button" data-ld-note-action="delete">删除</button>
+          </div>
+        </div>`
+    }
+    const typingHTML = pending.map(() => `
+      <div class="ld-note ld-note-typing">
+        <div class="ld-note-main">
+          <div class="ld-note-meta"><span>${ldEsc(page._ldChar.name)}</span></div>
+          <div class="ld-typing"><i></i><i></i><i></i></div>
+        </div>
+      </div>`).join('')
+
+    const askEventBusy = pendingKeys.has('event')
+    body.innerHTML = `
+      <div class="ld-detail-card">
+        <div class="ld-detail-head">
+          <span class="ld-detail-avatar">${ldAvatarHTML(author.avatar, author.name)}</span>
+          <span class="ld-detail-author">
+            <span class="ld-detail-name">${ldEsc(author.name)}</span>
+            <span class="ld-detail-date">${ldEsc(ldLongDay(ev.date))}</span>
+          </span>
+        </div>
+        <div class="ld-detail-content">${ldEsc(ev.text).replace(/\n/g, '<br>')}</div>
+      </div>
+      <div class="ld-notes">
+        <div class="ld-notes-title">备注</div>
+        ${ev.notes.length || pending.length
+          ? ev.notes.map(noteHTML).join('') + typingHTML
+          : '<div class="ld-notes-empty">还没有备注</div>'}
+      </div>
+      <div class="ld-detail-actions">
+        <button class="ld-detail-action" type="button" data-ld-note-root><i class="fa-regular fa-pen-to-square"></i><span>写备注</span></button>
+        <span class="ld-detail-divider"></span>
+        <button class="ld-detail-action" type="button" data-ld-ai-event ${askEventBusy ? 'disabled' : ''}><i class="fa-regular fa-comment-dots"></i><span>让 TA 评论</span></button>
+        <span class="ld-detail-divider"></span>
+        <button class="ld-detail-action ld-detail-action-more" type="button" data-ld-more><i class="fa-solid fa-ellipsis"></i></button>
+      </div>`
+
+    body.querySelector('[data-ld-note-root]').addEventListener('click', () => ldShowNoteInput(page, detail, ev, null))
+    body.querySelector('[data-ld-ai-event]').addEventListener('click', () => ldGenerate(page, detail, ev.id, null))
+    body.querySelector('[data-ld-more]').addEventListener('click', e => ldShowMoreMenu(e.currentTarget, page, detail, ev))
+    body.querySelectorAll('[data-ld-reply-note]').forEach(btn => {
+      btn.addEventListener('click', () => ldShowNoteInput(page, detail, ev, btn.dataset.ldReplyNote))
+    })
+    body.querySelectorAll('[data-ld-ai-reply]').forEach(btn => {
+      btn.addEventListener('click', () => ldGenerate(page, detail, ev.id, btn.dataset.ldAiReply))
+    })
+    ldBindNoteLongPress(page, detail, ev)
+  }
+
+  // ===== 备注：弹出输入、长按复制/删除（仿 iCity 小纸条） =====
+  function ldShowNoteInput(page, detail, ev, replyToId) {
+    if (document.getElementById('ld-note-modal')) return
+    const { modal, close } = ldOpenModal(`
+      <div class="ld-modal-title">${replyToId ? '回复备注' : '写备注'}</div>
+      <textarea class="ld-text-input ld-note-input" placeholder="写一句备注…"></textarea>
+      <div class="ld-actions">
+        <button class="ld-btn-cancel" type="button">取消</button>
+        <button class="ld-btn-ok ld-note-send" type="button" disabled>发送</button>
+      </div>`, 'ld-modal')
+    modal.id = 'ld-note-modal'
+    const input = modal.querySelector('.ld-note-input')
+    const send = modal.querySelector('.ld-note-send')
+    input.addEventListener('input', () => { send.disabled = !input.value.trim() })
+    modal.querySelector('.ld-btn-cancel').addEventListener('click', close)
+    send.addEventListener('click', async () => {
+      const comment = input.value.trim()
+      if (!comment) return
+      close()
+      const st = page._ld
+      await ldUpdate(st.ownerUid, st.charId, events => {
+        const target = events.find(e => e.id === ev.id)
+        if (!target) return
+        if (replyToId && !target.notes.some(n => String(n.id) === String(replyToId))) return
+        target.notes.push(ldMakeNote(comment, 'self', page._ldUser.name, replyToId || null, st.ownerUid))
+      })
+      await ldRenderDetail(page, detail)
+      ldRenderTimeline(page)
+      ldToast('备注已添加')
+    })
+    setTimeout(() => input.focus(), 260)
+  }
+
+  function ldCloseMenus(scope = document) {
+    scope.querySelectorAll?.('.ld-action-menu').forEach(m => m.remove())
+    scope.querySelectorAll?.('.ld-note.show-note-menu').forEach(n => n.classList.remove('show-note-menu'))
+  }
+
+  function ldBindNoteLongPress(page, detail, ev) {
+    const body = detail.querySelector('#ld-detail-body')
+    if (!body) return
+    let timer = null
+    let start = null
+    const clear = () => {
+      if (timer) { clearTimeout(timer); timer = null }
+      start = null
+    }
+    const showMenu = noteEl => {
+      ldCloseMenus(detail)
+      noteEl.classList.add('show-note-menu')
+      setTimeout(() => document.addEventListener('click', () => ldCloseMenus(detail), { once: true }), 100)
+    }
+
+    body.querySelectorAll('.ld-note[data-ld-note-id]').forEach(noteEl => {
+      noteEl.addEventListener('pointerdown', e => {
+        if (e.target.closest('[data-ld-reply-note]') || e.target.closest('[data-ld-ai-reply]') || e.target.closest('[data-ld-note-action]')) return
+        if (e.button !== undefined && e.button !== 0) return
+        clear()
+        start = { x: e.clientX, y: e.clientY, row: e.currentTarget }
+        timer = setTimeout(() => {
+          showMenu(start.row)
+          timer = null
+        }, 520)
+      })
+      noteEl.addEventListener('pointermove', e => {
+        if (!start) return
+        if (Math.abs(e.clientX - start.x) > 8 || Math.abs(e.clientY - start.y) > 8) clear()
+      })
+      noteEl.addEventListener('pointerup', clear)
+      noteEl.addEventListener('pointercancel', clear)
+      noteEl.addEventListener('contextmenu', e => {
+        e.preventDefault()
+        if (!e.target.closest('button')) showMenu(e.currentTarget)
+      })
+    })
+
+    body.querySelectorAll('[data-ld-note-action]').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation()
+        const action = e.currentTarget.dataset.ldNoteAction
+        const noteId = e.currentTarget.closest('.ld-note')?.dataset.ldNoteId
+        const note = ev.notes.find(n => String(n.id) === String(noteId))
+        ldCloseMenus(detail)
+        if (!noteId || !note) return
+        if (action === 'copy') await ldCopy(note.comment)
+        if (action === 'delete') await ldDeleteNote(page, detail, ev, noteId)
+      })
+    })
+    body.querySelector('.ld-notes')?.addEventListener('selectstart', e => {
+      if (e.target.closest('.ld-note')) e.preventDefault()
+    })
+  }
+
+  async function ldCopy(text) {
+    const value = String(text || '')
+    try {
+      await navigator.clipboard.writeText(value)
+      ldToast('已复制')
+    } catch (_) {
+      const input = document.createElement('textarea')
+      input.value = value
+      input.style.position = 'fixed'
+      input.style.left = '-9999px'
+      document.body.appendChild(input)
+      input.select()
+      const ok = document.execCommand?.('copy')
+      input.remove()
+      ldToast(ok ? '已复制' : '复制失败')
+    }
+  }
+
+  async function ldDeleteNote(page, detail, ev, noteId) {
+    const st = page._ld
+    await ldUpdate(st.ownerUid, st.charId, events => {
+      const target = events.find(e => e.id === ev.id)
+      if (!target) return
+      // 删除某条备注时，连带删掉它名下的所有回复
+      const ids = new Set([String(noteId)])
+      let changed = true
+      while (changed) {
+        changed = false
+        target.notes.forEach(n => {
+          if (n.replyToId && ids.has(String(n.replyToId)) && !ids.has(String(n.id))) {
+            ids.add(String(n.id))
+            changed = true
+          }
+        })
+      }
+      target.notes = target.notes.filter(n => !ids.has(String(n.id)))
+    })
+    await ldRenderDetail(page, detail)
+    ldRenderTimeline(page)
+    ldToast('备注已删除')
+  }
+
+  // ===== 事件的“更多”菜单：编辑 / 删除 =====
+  function ldShowMoreMenu(anchorEl, page, detail, ev) {
+    ldCloseMenus()
+    const menu = document.createElement('div')
+    menu.className = 'ld-action-menu'
+    menu.innerHTML = `
+      <button type="button" data-action="edit"><i class="fa fa-pen"></i><span>编辑</span></button>
+      <button type="button" data-action="delete"><i class="fa fa-trash"></i><span>删除</span></button>`
+    ;(document.getElementById('app') || document.body).appendChild(menu)
+    const rect = anchorEl.getBoundingClientRect()
+    const mRect = menu.getBoundingClientRect()
+    const left = Math.min(Math.max(rect.right - mRect.width, 8), window.innerWidth - mRect.width - 8)
+    menu.style.left = left + 'px'
+    menu.style.top = Math.max(8, rect.top - mRect.height - 8) + 'px'
+    menu.querySelector('[data-action="edit"]').addEventListener('click', () => {
+      menu.remove()
+      ldOpenEditor(page, ev, detail)
+    })
+    menu.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+      menu.remove()
+      if (!confirm('删除这件事和它下面的所有备注？')) return
+      const st = page._ld
+      await ldUpdate(st.ownerUid, st.charId, events => {
+        const idx = events.findIndex(e => e.id === ev.id)
+        if (idx >= 0) events.splice(idx, 1)
+      })
+      window.closePage('love-diary-detail')
+      ldRenderTimeline(page)
+      ldToast('已删除')
+    })
+    setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 100)
+  }
+
+  // ===== 让 TA 回复：收集上下文 =====
+  function ldResolvePlaceholders(text, ctx) {
+    return String(text || '')
+      .replace(/\{\{\s*(?:user|用户)\s*\}\}/gi, ctx.userName || '她')
+      .replace(/\{\{\s*(?:char|角色)\s*\}\}/gi, ctx.charName || '我')
+  }
+
+  // 只读，不碰记忆的读取计数
+  async function ldCollectContext(ownerUid, charId, ev) {
+    const char = await db.characters.get(charId)
+    if (!char) throw new Error('角色不存在')
+    const owner = await db.characters.get(ownerUid)
+    const profile = await ldFriendProfile(ownerUid, charId)
+    const friendName = ldCharDisplayName(char, profile)
+    const userName = String(owner?.nick || owner?.name || '').trim() || '她'
+    const charName = String(char.nick || char.name || '').trim() || '我'
+    const ph = { userName, charName }
+    const resolve = t => ldResolvePlaceholders(t, ph).trim()
+    const [dayStart, dayEnd] = ldDayRange(ev.date)
+    const inDay = ts => Number(ts) >= dayStart && Number(ts) < dayEnd
+
+    const persona = resolve(char.description)
+    const charRole = String(char.role || '').trim()
+
+    // 世界书：只取绑定该角色的单人世界书
+    const lorebooks = (await db.config.get('lorebooks'))?.value || []
+    const loreEntries = []
+    for (const book of lorebooks) {
+      if (book.enabled === false || book.scope !== 'personal') continue
+      if (!(book.charIds || []).map(Number).includes(Number(charId))) continue
+      for (const entry of (book.entries || [])) {
+        if (entry.enabled === false) continue
+        const c = resolve(entry.content)
+        if (c) loreEntries.push(c)
+      }
+    }
+
+    const fmtLine = (speaker, content) => {
+      const t = resolve(String(content == null ? '' : content)).replace(/\s+/g, ' ')
+      if (!t || /^(data:|blob:)/i.test(t)) return ''
+      return `${speaker}: ${t.slice(0, 200)}`
+    }
+
+    // 线上聊天：事件当天 + 最近
+    let dayChat = []
+    let recentChat = []
+    const chat = await db.chats.where('[ownerUid+charId]').equals([ownerUid, charId]).first()
+    if (chat) {
+      const dayMsgs = await db.messages.where('[chatId+createdAt]')
+        .between([chat.id, dayStart], [chat.id, dayEnd], true, false).toArray()
+      const dayIds = new Set(dayMsgs.map(m => m.id))
+      dayChat = dayMsgs.slice(-40)
+      const recent = await db.messages.where('[chatId+createdAt]')
+        .between([chat.id, Dexie.minKey], [chat.id, Dexie.maxKey]).reverse().limit(20).toArray()
+      recentChat = recent.reverse().filter(m => !dayIds.has(m.id))
+    }
+    const chatLines = list => list
+      .map(m => fmtLine(m.role === 'user' ? userName : friendName, m.content))
+      .filter(Boolean)
+
+    // 线下见面：事件当天 + 最近
+    let dayOffline = []
+    let recentOffline = []
+    try {
+      const rows = (await db.offlineChats.where('charId').equals(charId).toArray())
+        .filter(r => (r.ownerUid == null || Number(r.ownerUid) === Number(ownerUid)) && String(r.content || '').trim())
+        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+      dayOffline = rows.filter(r => inDay(r.createdAt)).slice(-30)
+      const dayIds = new Set(dayOffline.map(r => r.id))
+      recentOffline = rows.filter(r => !dayIds.has(r.id)).slice(-10)
+    } catch (e) {
+      console.warn('[loveDiary] 读取线下见面记录失败：', e)
+    }
+    const offlineLines = list => list
+      .map(r => fmtLine(r.role === 'user' ? userName : friendName, r.content))
+      .filter(Boolean)
+
+    // 自动生成的记忆：当天的优先，再补高重要度的
+    let memLines = []
+    try {
+      const mems = await db.memories.where('[ownerUid+charId]').equals([ownerUid, charId])
+        .filter(m => m.status !== 'archived').toArray()
+      const dayMems = mems.filter(m => inDay(m.sourceAt))
+      const dayMemIds = new Set(dayMems.map(m => m.id))
+      const others = mems.filter(m => !dayMemIds.has(m.id))
+        .sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0) || (b.updatedAt || 0) - (a.updatedAt || 0))
+        .slice(0, Math.max(0, 10 - dayMems.length))
+      memLines = dayMems.concat(others)
+        .sort((a, b) => (Number(a.sourceAt) || Infinity) - (Number(b.sourceAt) || Infinity))
+        .map(m => {
+          const when = Number(m.sourceAt) > 0 ? `【${ldDayOf(m.sourceAt)}】` : ''
+          const t = resolve(`${m.title || ''}：${m.content || ''}`)
+          return t ? `${when}${t}` : ''
+        })
+        .filter(Boolean)
+    } catch (e) {
+      console.warn('[loveDiary] 读取记忆失败：', e)
+    }
+
+    return {
+      ownerUid, charId, userName, charName, friendName, persona, charRole,
+      loreText: loreEntries.join('\n\n'),
+      dayChat: chatLines(dayChat),
+      recentChat: chatLines(recentChat),
+      dayOffline: offlineLines(dayOffline),
+      recentOffline: offlineLines(recentOffline),
+      memLines,
+      resolve
+    }
+  }
+
+  function ldBuildPrompt(ctx, ev, target) {
+    const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
+${ctx.persona || '暂无额外设定。'}
+${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
+你和「${ctx.userName}」一起维护着一本“恋爱记”，按日期记下你们之间发生过的事，每件事下面可以留备注。现在你要在这本恋爱记里留一条备注。要求：
+· 用「我」的口吻，像平时和${ctx.userName}说话那样，自然、简短，一两句话，最多 80 字。
+· 只输出这条备注的正文，不要名字前缀、引号、标题、日期，也不要任何解释。
+· 要贴着这件事本身。下面给你的聊天、见面、记忆里确实出现过的细节可以用，没出现过的事不要编。
+· 不要重复这件事下已有备注的说法，不要套话，不要总结升华。
+· 不要输出任何双花括号包裹的模板占位符。`
+
+    const evAuthor = ev.authorType === 'role' ? ctx.friendName : ctx.userName
+    const parts = [`【这件事】\n日期：${ldLongDay(ev.date)}\n记录人：${evAuthor}\n内容：${ctx.resolve(ev.text)}`]
+
+    if (ev.notes.length) {
+      const nameOf = n => (n.fromType === 'role' ? ctx.friendName : ctx.userName)
+      parts.push('【这件事下已有的备注】（按时间先后）\n' + ev.notes.map(n => {
+        const parent = n.replyToId ? ev.notes.find(x => String(x.id) === String(n.replyToId)) : null
+        return `- ${nameOf(n)}${parent ? ` 回复 ${nameOf(parent)}` : ''}：${ctx.resolve(n.comment)}`
+      }).join('\n'))
+    }
+
+    if (target) {
+      const targetName = target.fromType === 'role' ? ctx.friendName : ctx.userName
+      parts.push(target.fromType === 'role'
+        ? `【任务】接着你自己之前的这条备注，再补一句：「${ctx.resolve(target.comment)}」`
+        : `【任务】回复${targetName}的这条备注：「${ctx.resolve(target.comment)}」`)
+    } else {
+      parts.push('【任务】对这件事本身留一条备注。')
+    }
+
+    const refs = []
+    if (ctx.dayChat.length) refs.push(`【事件当天的线上聊天】\n${ctx.dayChat.join('\n')}`)
+    if (ctx.dayOffline.length) refs.push(`【事件当天的线下见面】\n${ctx.dayOffline.join('\n')}`)
+    if (ctx.memLines.length) refs.push(`【相关记忆】\n${ctx.memLines.join('\n')}`)
+    if (ctx.recentChat.length) refs.push(`【最近的线上聊天】\n${ctx.recentChat.join('\n')}`)
+    if (ctx.recentOffline.length) refs.push(`【最近的线下见面】\n${ctx.recentOffline.join('\n')}`)
+    if (refs.length) parts.push('以下只是供你参考的背景，别照搬原文：\n\n' + refs.join('\n\n'))
+
+    return { systemPrompt, userPrompt: parts.join('\n\n') }
+  }
+
+  function ldCleanReply(raw, ctx) {
+    let t = String(raw == null ? '' : raw)
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .trim()
+    if (t.startsWith('```')) t = t.replace(/^```(?:\w+)?\s*/, '').replace(/\s*```$/, '').trim()
+    const names = [ctx.friendName, ctx.charName].filter(Boolean).map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    if (names.length) t = t.replace(new RegExp('^(?:' + names.join('|') + ')\\s*[:：]\\s*'), '')
+    t = t.replace(/^["“「『]+|["”」』]+$/g, '').trim()
+    return ldResolvePlaceholders(t, ctx).trim().slice(0, 300)
+  }
+
+  async function ldGenerate(page, detail, eventId, targetNoteId) {
+    const st = page._ld
+    const ownerUid = st.ownerUid
+    const charId = st.charId
+    if (!window.callAI) {
+      ldToast('请先在设置里配置 API')
+      return
+    }
+    const pendingMap = page._ldPending
+    const list = (pendingMap[eventId] = pendingMap[eventId] || [])
+    const pkey = targetNoteId ? String(targetNoteId) : 'event'
+    if (list.some(p => p.key === pkey)) return
+    list.push({ key: pkey })
+    ldRenderDetail(page, detail)
+
+    try {
+      const events = await ldLoad(ownerUid, charId)
+      const ev = events.find(e => e.id === eventId)
+      if (!ev) return
+      const target = targetNoteId ? ev.notes.find(n => String(n.id) === String(targetNoteId)) : null
+      if (targetNoteId && !target) return
+
+      const ctx = await ldCollectContext(ownerUid, charId, ev)
+      const prompt = ldBuildPrompt(ctx, ev, target)
+      const opts = { system: prompt.systemPrompt }
+      if (window.getAITemperaturePreset) {
+        const temp = await window.getAITemperaturePreset('icityDiary')
+        if (temp !== undefined && temp !== null) opts.temperature = temp
+      }
+      const raw = await window.callAI([{ role: 'user', content: prompt.userPrompt }], opts)
+      const text = ldCleanReply(raw, ctx)
+      if (!text) throw new Error('AI 没有返回内容，请重试')
+
+      await ldUpdate(ownerUid, charId, events2 => {
+        const e2 = events2.find(e => e.id === eventId)
+        if (!e2) return
+        if (target && !e2.notes.some(n => String(n.id) === String(target.id))) return
+        e2.notes.push(ldMakeNote(text, 'role', ctx.friendName, target ? target.id : null, charId))
+      })
+    } catch (e) {
+      const msg = e?.message || String(e)
+      const isConfigError = /API|配置|Base URL|Key|模型/.test(msg)
+      ldToast(isConfigError ? '请先在设置里配置 API' : '生成失败：' + msg.slice(0, 80))
+    } finally {
+      pendingMap[eventId] = (pendingMap[eventId] || []).filter(p => p.key !== pkey)
+      if (document.body.contains(detail)) ldRenderDetail(page, detail)
+      if (document.body.contains(page)) ldRenderTimeline(page)
+    }
+  }
+})()
 
