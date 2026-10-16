@@ -699,3 +699,31 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ===== 翻记忆按钮 ===== */
+.ld-pick-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: calc(100% - 36px);
+  height: 36px;
+  margin: 8px 18px 0;
+  border: 1px solid var(--ld-line);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ld-accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-pick-btn:active {
+  background: var(--ld-soft);
+}
+
+.ld-pick-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
