@@ -6171,7 +6171,56 @@ function _wcRegexSalvageFields(text) {
 function _wcStripCodeFences(s) {
   return s.replace(/```[a-z]*\s*\n?/gi, '').replace(/```/g, '').trim()
 }
-
+// 修复 JSON 字符串里未转义的英文双引号（角色用 [引用"我：原话"并回复：…] 格式时极易出现）、
+// 裸换行、尾逗号，并补全被截断的结尾；顶层对象结束后的多余文字会被丢掉
+function _wcRepairInnerQuotes(text) {
+  const start = text.indexOf('{')
+  if (start < 0) return null
+  let out = ''
+  let inString = false
+  let escaped = false
+  const stack = []
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue }
+      if (ch === '\\') { out += ch; escaped = true; continue }
+      if (ch === '"') {
+        // 引号后面第一个非空白字符是 : } ] 或者 ", 下一个键/值" 时，才算字符串真正结束
+        let j = i + 1
+        while (j < text.length && /\s/.test(text[j])) j++
+        const nx = text[j]
+        let isEnd = nx === undefined || nx === ':' || nx === '}' || nx === ']'
+        if (!isEnd && nx === ',') {
+          let k = j + 1
+          while (k < text.length && /\s/.test(text[k])) k++
+          isEnd = k >= text.length || /["{\[\]}]/.test(text[k])
+        }
+        if (isEnd) { inString = false; out += ch } else { out += '\\"' }
+        continue
+      }
+      if (ch === '\n') { out += '\\n'; continue }
+      if (ch === '\r') continue
+      if (ch === '\t') { out += '\\t'; continue }
+      if (ch.charCodeAt(0) < 0x20) continue
+      out += ch
+      continue
+    }
+    if (ch === '"') { inString = true; out += ch; continue }
+    if (ch === '{' || ch === '[') { stack.push(ch); out += ch; continue }
+    if (ch === '}' || ch === ']') {
+      stack.pop()
+      out += ch
+      if (!stack.length) break
+      continue
+    }
+    out += ch
+  }
+  if (inString) out += '"'
+  out = out.replace(/[\s,:]+$/, '')
+  while (stack.length) out += stack.pop() === '{' ? '}' : ']'
+  return out.replace(/,\s*([}\]])/g, '$1')
+}
 function extractAIJson(text) {
   if (!text) return null
   const s = text.trim()
@@ -6188,6 +6237,14 @@ function extractAIJson(text) {
     candidates.push(inner)
   }
   candidates.push(s)
+ 
+  // 2.5 字符串里有未转义的英文双引号（引用原话时常见）→ 修复后再解析，避免被后面的“正则抢救”截断
+  for (const cand of candidates) {
+    const fixed = _wcRepairInnerQuotes(cand)
+    const o = fixed && _tryParseJsonObject(fixed)
+    if (o) return o
+  }
+
   // 3-5. 括号配对提取 → 修复重试 → 截断补全
   for (const cand of candidates) {
     const sliced = _wcSliceJsonObject(cand)
@@ -19939,6 +19996,42 @@ function appendCallUserBubble(page, text) {
   const conversation = page.querySelector('#call-conversation')
   if (conversation) conversation.scrollTop = conversation.scrollHeight
 }
+// 通话里“对方正在回复”的三点跳动占位（样式由 JS 自带，不用改 CSS 文件）
+function ensureCallTypingStyle() {
+  if (document.getElementById('call-typing-style')) return
+  const style = document.createElement('style')
+  style.id = 'call-typing-style'
+  style.textContent = `
+    .call-typing-dots { display: inline-flex; align-items: center; gap: 5px; min-height: 20px; }
+    .call-typing-dots i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.45; animation: call-typing-bounce 1.2s infinite ease-in-out; }
+    .call-typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+    .call-typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes call-typing-bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-4px); opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) { .call-typing-dots i { animation: none; opacity: 0.8; } }
+  `
+  document.head.appendChild(style)
+}
+
+function showCallTypingIndicator(page) {
+  const container = page?.querySelector('#call-messages')
+  if (!container) return null
+  ensureCallTypingStyle()
+  const el = document.createElement('div')
+  el.className = 'call-msg call-msg-assistant call-msg-typing'
+  el.innerHTML = '<span class="call-msg-text call-typing-dots"><i></i><i></i><i></i></span>'
+  container.appendChild(el)
+  const conversation = page.querySelector('#call-conversation')
+  if (conversation) conversation.scrollTop = conversation.scrollHeight
+  return el
+}
+
+function removeCallTypingIndicator(el) {
+  if (el && el.parentNode) el.remove()
+}
+
 
 async function sendCallAIRequest(page) {
   if (_callAISending) return
@@ -19946,7 +20039,7 @@ async function sendCallAIRequest(page) {
 
   const statusEl = page.querySelector('#call-status')
   const prevStatus = statusEl?.textContent || ''
-
+  let typingEl = null
   try {
     if (_callState === 'connecting') {
       updateCallStatus(page, '正在等待接听...')
@@ -19968,14 +20061,15 @@ async function sendCallAIRequest(page) {
         }
       }
     }
-
+    typingEl = showCallTypingIndicator(page)
     const raw = await window.callAI(messages, {
       system: _callSystemPrompt,
       responseFormat: 'json_object',
       responseJsonSchema: CALL_AI_JSON_SCHEMA,
       temperature: await window.getAITemperaturePreset('wechatCall')
     })
-
+    removeCallTypingIndicator(typingEl)
+    typingEl = null
     if (_callState === 'idle') return
 
     const parsed = extractCallJson(raw)
@@ -20006,6 +20100,7 @@ async function sendCallAIRequest(page) {
     }
     window.toast?.('通话出错：' + (e.message || '').slice(0, 100))
   } finally {
+        removeCallTypingIndicator(typingEl)
     _callAISending = false
   }
 }
