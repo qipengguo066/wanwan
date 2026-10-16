@@ -9,6 +9,7 @@
   const LD_DAY_START_HOUR = 5      // 凌晨 5 点前算前一天
   const LD_SORT_DESC = true        // true：新的在上；false：旧的在上
   const LD_MAX_EVENT_LEN = 300
+  const LD_MEMORY_CANDIDATES = 30  // “翻记忆”时，每次最多给 TA 看多少条候选记忆
   const ldLocks = {}
 
   // ===== 通用小工具 =====
@@ -90,6 +91,7 @@
           date: ldIsDay(ev?.date) ? ev.date : ldDayOf(createdAt),
           text: String(ev?.text || '').trim(),
           authorType: ev?.authorType === 'role' ? 'role' : 'self',
+          fromMemoryId: ev?.fromMemoryId ?? null,
           createdAt,
           notes: notes
             .map(n => {
@@ -371,7 +373,8 @@
       <div class="ld-auto-row">
         <span class="ld-auto-text">${ldEsc(ch.name)} 写完自己的日记后，可以自己决定要不要在这里记一件事</span>
         <button class="ld-switch${autoOn ? ' is-on' : ''}" id="ld-auto-switch" type="button" role="switch" aria-checked="${autoOn}"><i></i></button>
-      </div>`
+      </div>
+      <button class="ld-pick-btn" id="ld-pick-memory" type="button"><i class="fa-solid fa-book-open"></i> 让 TA 翻翻记忆，挑一件最重要的事记下来</button>`
 
     if (!events.length) {
       body.innerHTML = `
@@ -1027,6 +1030,8 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
   }
 
   function ldBindAuto(page) {
+    const pick = page.querySelector('#ld-pick-memory')
+    if (pick) pick.addEventListener('click', () => ldPickFromMemory(page, pick))
     const btn = page.querySelector('#ld-auto-switch')
     if (!btn) return
     btn.addEventListener('click', async () => {
@@ -1124,6 +1129,127 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       })
     } catch (e) {
       console.warn('[loveDiary] 日记联动失败：', e)
+    }
+  }
+
+  // ===== 翻记忆：从记忆长廊里挑一条最值得记的 =====
+  // · 候选：该账号和该角色未归档的记忆，排除已经被挑过的；按重要度、时间排序取前 LD_MEMORY_CANDIDATES 条
+  // · 一次只挑一条；再点一次会自动换下一条（已挑过的不会再出现）
+  // · 事件日期 = 该记忆的发生时间（sourceAt）所在的那天，凌晨 5 点前算前一天
+  async function ldPickFromMemory(page, btn) {
+    const st = page._ld
+    if (!st || st.view !== 'timeline' || page._ldPicking) return
+    if (!window.callAI) {
+      ldToast('请先在设置里配置 API')
+      return
+    }
+    const ownerUid = st.ownerUid
+    const charId = st.charId
+    page._ldPicking = true
+    const btnHTML = btn.innerHTML
+    btn.disabled = true
+    btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> TA 正在翻记忆…'
+    try {
+      const events = await ldLoad(ownerUid, charId)
+      const used = new Set(events.filter(e => e.fromMemoryId != null).map(e => String(e.fromMemoryId)))
+      const mems = (await db.memories.where('[ownerUid+charId]').equals([ownerUid, charId])
+        .filter(m => m.status !== 'archived' && !used.has(String(m.id))).toArray())
+        .sort((a, b) =>
+          (Number(b.importance) || 0) - (Number(a.importance) || 0) ||
+          (ldTs(b.sourceAt) || ldTs(b.createdAt)) - (ldTs(a.sourceAt) || ldTs(a.createdAt)))
+      if (!mems.length) {
+        ldToast('记忆库里没有可以挑的新记忆了')
+        return
+      }
+      const cands = mems.slice(0, LD_MEMORY_CANDIDATES)
+
+      const ctx = await ldCollectContext(ownerUid, charId, { date: ldDayOf(Date.now()), text: '', notes: [], authorType: 'role' })
+      const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
+${ctx.persona || '暂无额外设定。'}
+${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
+你和「${ctx.userName}」一起维护着一本“恋爱记”，按日期记录你们之间发生过、值得留下的事。现在请你从下面的记忆里，挑出最值得记进恋爱记的一件事。
+规则：
+· 只能从下面编号的记忆里挑，只挑一条。
+· 优先挑：关系的转折、第一次、重要的约定、难忘的见面或对话。日常闲聊和琐碎信息不挑。
+· 不要挑和“恋爱记里已有的事”重复或几乎一样的。
+· 把它写成一句话，30 字以内，用你自己的口吻，可以用“我们”。只写记忆里确实有的内容，不要添油加醋。
+· 只输出一行，格式严格如下，不要任何解释：
+  选｜记忆编号｜这件事
+  如果这些记忆都不值得记，只输出：无
+· 不要输出任何双花括号包裹的模板占位符。`
+
+      const parts = []
+      const recentEvents = ldSortEvents(events).slice(0, 12)
+      if (recentEvents.length) {
+        parts.push('【恋爱记里已有的事】\n' + recentEvents.map(e =>
+          `- ${e.date} ${e.authorType === 'role' ? ctx.friendName : ctx.userName}：${ctx.resolve(e.text)}`
+        ).join('\n'))
+      }
+      parts.push('【可以挑的记忆】\n' + cands.map((m, i) => {
+        const ts = ldTs(m.sourceAt)
+        const when = ts ? ldDayOf(ts) : '时间未知'
+        const src = (m.sourceType ? m.sourceType === 'offlineMeet' : !!m.sourceSessionId) ? '线下' : '线上'
+        return `#${i + 1} [${when}｜${src}｜重要度${m.importance || 5}] ${ctx.resolve(`${m.title || ''}：${m.content || ''}`)}`
+      }).join('\n'))
+      parts.push('请挑出最值得记的一件事。')
+
+      const callOpts = { system: systemPrompt }
+      if (window.getAITemperaturePreset) {
+        const temp = await window.getAITemperaturePreset('icityDiary')
+        if (temp !== undefined && temp !== null) callOpts.temperature = temp
+      }
+      const raw = await window.callAI([{ role: 'user', content: parts.join('\n\n') }], callOpts)
+      const answer = String(raw == null ? '' : raw).replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+      const lines = answer.split('\n').map(x => x.trim()).filter(Boolean)
+      const hit = lines.map(l => l.match(/^选\s*[｜|]\s*#?(\d+)\s*[｜|]\s*(.+)$/)).find(Boolean)
+      if (!hit) {
+        if (lines.some(l => /^无/.test(l))) {
+          ldToast('TA 觉得这些记忆里暂时没有新的值得记的事')
+          return
+        }
+        const err = new Error('没有从模型的返回里读到可用的结果，请重试')
+        err.rawOutput = answer
+        throw err
+      }
+      const mem = cands[parseInt(hit[1], 10) - 1]
+      if (!mem) {
+        const err = new Error('模型选的记忆编号不存在，请重试')
+        err.rawOutput = answer
+        throw err
+      }
+      const text = ldResolvePlaceholders(hit[2], ctx).replace(/^["“「『]+|["”」』]+$/g, '').trim().slice(0, 60)
+      if (!text) throw new Error('模型没有写出事件内容，请重试')
+      const memTs = ldTs(mem.sourceAt) || ldTs(mem.createdAt) || Date.now()
+      const date = ldDayOf(memTs)
+
+      await ldUpdate(ownerUid, charId, list => {
+        if (list.some(e => e.fromMemoryId != null && String(e.fromMemoryId) === String(mem.id))) return
+        list.push({
+          id: ldMakeId('ev'),
+          date,
+          text,
+          authorType: 'role',
+          fromMemoryId: mem.id,
+          createdAt: Date.now(),
+          notes: []
+        })
+      })
+      ldToast(`${ctx.friendName}记下了一件事（${ldShortDay(date)}）`)
+      if (document.body.contains(page)) await ldRenderTimeline(page)
+    } catch (e) {
+      const msg = e?.message || String(e)
+      const isConfigError = /API|配置|Base URL|Key|模型/.test(msg) && !e?.rawOutput
+      ldShowError({
+        title: '翻记忆失败',
+        message: isConfigError ? '请先检查设置里的 API 配置。' : msg,
+        detail: msg + (e?.rawOutput ? '\n\n模型原始返回：\n' + String(e.rawOutput).slice(0, 2000) : '')
+      })
+    } finally {
+      page._ldPicking = false
+      if (btn.isConnected) {
+        btn.disabled = false
+        btn.innerHTML = btnHTML
+      }
     }
   }
 
