@@ -398,7 +398,7 @@ function sanitizePhoneNotesData(raw) {
     .map(n => ({
       title: clean(n?.title),
       time: clean(n?.time),
-      content: String(n?.content ?? '').replace(/\r\n/g, '\n').trim(),
+      content: String(n?.content ?? '').replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim(),
       pinned: n?.pinned === true
     }))
     .filter(n => n.content || n.title)
@@ -489,7 +489,7 @@ function sanitizePhoneMailData(raw) {
       sender: clean(e?.sender),
       address: clean(e?.address),
       subject: clean(e?.subject),
-      body: String(e?.body ?? '').replace(/\r\n/g, '\n').trim(),
+      body: String(e?.body ?? '').replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim(),
       time: clean(e?.time),
       unread: e?.unread === true,
       spam: e?.spam === true,
@@ -561,6 +561,67 @@ function stampPhoneAppTimes(appId, data, now = Date.now()) {
 }
 
 // ===== 生成主流程（全量生成，已有快照直接覆盖） =====
+// 宽容的 JSON 解析：处理代码块、前后多余的文字、字符串里的裸换行、
+// 未转义的双引号、末尾多余的逗号、以及被截断的输出（会丢掉没写完的最后一项）
+function repairPhoneJsonLoose(src) {
+  let out = ''
+  let inStr = false
+  let esc = false
+  const stack = []
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]
+    if (inStr) {
+      if (esc) { out += c; esc = false; continue }
+      if (c === '\\') { out += c; esc = true; continue }
+      if (c === '"') {
+        // 后面第一个非空白字符是 , } ] : 才算字符串结束，否则当作正文里的引号
+        let j = i + 1
+        while (j < src.length && /\s/.test(src[j])) j++
+        const nx = src[j]
+        if (nx === undefined || nx === ',' || nx === '}' || nx === ']' || nx === ':') {
+          inStr = false
+          out += c
+        } else {
+          out += '\\"'
+        }
+        continue
+      }
+      if (c === '\n') { out += '\\n'; continue }
+      if (c === '\r') continue
+      if (c === '\t') { out += '\\t'; continue }
+      out += c
+      continue
+    }
+    if (c === '"') { inStr = true; out += c; continue }
+    if (c === '{' || c === '[') stack.push(c)
+    else if (c === '}' || c === ']') stack.pop()
+    out += c
+  }
+  if (inStr) out += '"'
+  out = out.replace(/[,\s]+$/, '')
+  while (stack.length) out += stack.pop() === '{' ? '}' : ']'
+  return out.replace(/,\s*([}\]])/g, '$1')
+}
+
+function parsePhoneSnapshotJsonLoose(raw) {
+  let text = String(raw == null ? '' : raw).replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+  const start = text.indexOf('{')
+  if (start < 0) return null
+  const end = text.lastIndexOf('}')
+  const body = end > start ? text.slice(start, end + 1) : text.slice(start)
+  const tryParse = s => {
+    try {
+      const v = JSON.parse(s)
+      return v && typeof v === 'object' ? v : null
+    } catch (_) {
+      return null
+    }
+  }
+  return tryParse(body) ||
+    tryParse(repairPhoneJsonLoose(body)) ||
+    (end > start ? tryParse(repairPhoneJsonLoose(text.slice(start))) : null)
+}
 
 async function generatePhoneAppSnapshot(appId, ownerUid, charId) {
   if (typeof window.callAI !== 'function') throw new Error('请先在设置里配置 API')
@@ -588,8 +649,15 @@ async function generatePhoneAppSnapshot(appId, ownerUid, charId) {
     responseFormat: 'json_object',
     temperature: await getPhoneSnapshotTemperature()
   })
-  const parsed = extractPhoneSnapshotJson(raw)
-  if (!parsed) throw new Error('AI 返回格式异常，请重试')
+  let parsed = null
+  try { parsed = extractPhoneSnapshotJson(raw) } catch (_) {}
+  if (!parsed) parsed = parsePhoneSnapshotJsonLoose(raw)
+  if (!parsed) {
+    window._lastPhoneSnapshotRaw = String(raw || '')
+    console.warn('[phone-apps] 返回格式异常，模型原始内容：', raw)
+    const hint = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 60)
+    throw new Error('AI 返回格式异常，请重试' + (hint ? `（模型返回开头：${hint}）` : '（模型没有返回内容）'))
+  }
   const cleaned = sanitize(parsed)
   if (!cleaned || phoneAppDataIsEmpty(appId, cleaned)) throw new Error('生成结果为空，请重试')
 
