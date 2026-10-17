@@ -7825,14 +7825,14 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
   const loreAfterBlock = loreSeg.after
     ? `# 【补充世界观设定】\n${loreSeg.after}\n\n---\n\n`
     : ''
-  let system = buildSystemPart5(charName, userName, thoughtTemplate) +
+    let system = buildSystemPart5(charName, userName, thoughtTemplate) +
     buildSystemBilingualPart(bilingualSettings) +
     buildSystemPart1(char, charName, loreSeg.middle, loreSeg.before) +
-    buildSystemMemoryPart(memoryCtx) +
-    part2 +
     loreAfterBlock +
     buildSystemPart3(charName, userName, stickerNames, imageGenEnabled) +
-    buildSystemPart4(charName, userName)
+    buildSystemPart4(charName, userName) +
+    buildSystemMemoryPart(memoryCtx) +
+    part2
 
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
