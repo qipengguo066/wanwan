@@ -154,20 +154,30 @@
     ])
     var sub = { url: rows[0]?.value || '', key: rows[1]?.value || '', model: rows[2]?.value || '' }
     var primary = { url: rows[3]?.value || '', key: rows[4]?.value || '', model: rows[5]?.value || '' }
-    return (sub.url && sub.key && sub.model) ? sub : primary
+        return (sub.url && sub.key && sub.model)
+      ? Object.assign(sub, { source: '副API' })
+      : Object.assign(primary, { source: '主API（聊天模型）' })
   }
 
   async function createEmbedding(input) {
     var cfg = await getEmbeddingConfig()
     if (!cfg.url || !cfg.key || !cfg.model) throw new Error('向量 API 未配置')
-    var res = await fetch(String(cfg.url).replace(/\/$/, '') + '/embeddings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.key },
-      body: JSON.stringify({ model: cfg.model, input: input })
-    })
+       var endpoint = String(cfg.url).replace(/\/$/, '') + '/embeddings'
+    var where = '（' + (cfg.source || '') + ' · ' + endpoint + ' · 模型 ' + cfg.model + '）'
+    var res
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.key },
+        body: JSON.stringify({ model: cfg.model, input: input })
+      })
+    } catch (netErr) {
+      throw new Error('请求失败，可能是网络或跨域：' + (netErr.message || netErr) + where)
+    }
     var text = await res.text()
-    var json = text ? JSON.parse(text) : {}
-    if (!res.ok) throw new Error(json?.error?.message || json?.message || ('向量接口失败：HTTP ' + res.status))
+    var json = {}
+    try { json = text ? JSON.parse(text) : {} } catch (_) {}
+    if (!res.ok) throw new Error((json?.error?.message || json?.message || ('HTTP ' + res.status + ' ' + String(text).slice(0, 80))) + where)
     var embedding = json?.data?.[0]?.embedding
     if (!Array.isArray(embedding)) throw new Error('向量接口未返回 embedding 数组')
     await db.config.put({ key: 'memoryEmbeddingStatus', value: { ok: true, testedAt: Date.now(), dim: embedding.length, error: '' } })
@@ -181,7 +191,7 @@
       return true
     } catch (e) {
       await db.config.put({ key: 'memoryEmbeddingStatus', value: { ok: false, testedAt: Date.now(), error: e.message || String(e) } })
-      window.toast && window.toast('向量不可用，已使用基础检索')
+      window.toast && window.toast('向量不可用：' + String(e.message || e).slice(0, 120))
       return false
     }
   }
@@ -1018,7 +1028,7 @@ ${lines}`
     var status = (await db.config.get('memoryEmbeddingStatus'))?.value || null
     var lastSummary = (await db.config.get('memoryLastSummaryAt'))?.value || ''
     var memoryApi = window.loadMemoryApiConfig ? await window.loadMemoryApiConfig() : null
-    var embeddingText = !status ? '未测试' : (status.ok ? '可用' : '不可用')
+    var embeddingText = !status ? '未测试' : (status.ok ? '可用' : '不可用' + (status.error ? '：' + String(status.error).slice(0, 100) : ''))
     var activeRole = state.charId ? chars[state.charId] : null
     var listTitle = activeRole ? getCharName(activeRole) + '的回忆' : '全部回忆'
     var roleSubtitle = (await db.config.get('memoryRoleSubtitle'))?.value || ROLE_SUBTITLE_DEFAULT
