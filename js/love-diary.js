@@ -355,6 +355,7 @@
     page._ldTimelineToken = token
     const events = ldSortEvents(await ldLoad(st.ownerUid, st.charId))
     const autoOn = await ldAutoEnabled(st.ownerUid, st.charId)
+    const lastCheck = await ldGetCheck(st.ownerUid, st.charId)
     if (page._ldTimelineToken !== token || page._ld.view !== 'timeline') return
 
     const ch = page._ldChar
@@ -373,6 +374,10 @@
       <div class="ld-auto-row">
         <span class="ld-auto-text">${ldEsc(ch.name)} 写完自己的日记后，可以自己决定要不要在这里记一件事</span>
         <button class="ld-switch${autoOn ? ' is-on' : ''}" id="ld-auto-switch" type="button" role="switch" aria-checked="${autoOn}"><i></i></button>
+      </div>
+      <div class="ld-check-row">
+        <button class="ld-check-line" id="ld-check-line" type="button">${ldEsc(ldCheckLabel(lastCheck))}</button>
+        <button class="ld-check-run" id="ld-check-run" type="button">用最近一篇日记检定一次</button>
       </div>
       <button class="ld-pick-btn" id="ld-pick-memory" type="button"><i class="fa-solid fa-book-open"></i> 让 TA 翻翻记忆，挑一件最重要的事记下来</button>`
 
@@ -1032,6 +1037,21 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
   function ldBindAuto(page) {
     const pick = page.querySelector('#ld-pick-memory')
     if (pick) pick.addEventListener('click', () => ldPickFromMemory(page, pick))
+    const runCheck = page.querySelector('#ld-check-run')
+    if (runCheck) runCheck.addEventListener('click', () => ldRunCheckNow(page, runCheck))
+    const checkLine = page.querySelector('#ld-check-line')
+    if (checkLine) {
+      checkLine.addEventListener('click', async () => {
+        const st = page._ld
+        if (!st) return
+        const c = await ldGetCheck(st.ownerUid, st.charId)
+        ldShowError({
+          title: '最近一次检定',
+          message: ldCheckLabel(c),
+          detail: c && c.raw ? '模型原始回复：\n' + c.raw : ''
+        })
+      })
+    }
     const btn = page.querySelector('#ld-auto-switch')
     if (!btn) return
     btn.addEventListener('click', async () => {
@@ -1050,20 +1070,68 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     return `${t.getFullYear()}-${pad2(t.getMonth() + 1)}-${pad2(t.getDate())}`
   }
 
-  async function ldAfterDiary(opts) {
+  // 记录最近一次“日记联动检定”的结果，方便在时间轴上看到它有没有跑、为什么没记
+  async function ldSaveCheck(ownerUid, charId, status, detail, raw) {
     try {
-      const ownerUid = Number(opts?.ownerUid)
-      const charId = Number(opts?.charId)
+      await db.config.put({
+        key: `loveDiaryCheck_${ownerUid}_${charId}`,
+        value: { at: Date.now(), status, detail: detail || '', raw: raw || '' }
+      })
+    } catch (_) {}
+  }
+
+  async function ldGetCheck(ownerUid, charId) {
+    const row = await db.config.get(`loveDiaryCheck_${ownerUid}_${charId}`)
+    return row?.value || null
+  }
+
+  function ldCheckLabel(c) {
+    if (!c) return '还没有检定记录。生成日记后这里会出现结果；如果生成了日记这里仍然是空的，说明 iCity 那边还没接上。'
+    const t = new Date(c.at)
+    const time = `${pad2(t.getMonth() + 1)}-${pad2(t.getDate())} ${pad2(t.getHours())}:${pad2(t.getMinutes())}`
+    const map = {
+      running: '检定进行中，或上次没有跑完',
+      none: 'TA 看了日记，觉得没有值得记的事',
+      recorded: '记了一件：' + (c.detail || ''),
+      format: '模型回复的格式不对，被当作“不记”',
+      error: '出错：' + (c.detail || ''),
+      skip: '跳过：' + (c.detail || ''),
+      off: '联动开关是关着的'
+    }
+    return `最近一次检定（${time}）：${map[c.status] || c.status}`
+  }
+
+  function ldLatestRoleDiary(ownerUid, charId) {
+    try {
+      const list = JSON.parse(localStorage.getItem('wanwan_icity_posts_' + ownerUid) || '[]')
+      return list
+        .filter(p => p && p.authorType === 'role' && Number(p.authorId) === Number(charId) && String(p.text || '').trim())
+        .sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0))[0] || null
+    } catch (_) {
+      return null
+    }
+  }
+
+  async function ldAfterDiary(opts) {
+    const ownerUid = Number(opts?.ownerUid)
+    const charId = Number(opts?.charId)
+    if (!ownerUid || !charId) return
+    let rawAnswer = ''
+    try {
+      await ldSaveCheck(ownerUid, charId, 'running', '')
       const diaryText = String(opts?.diaryText || '').trim()
-      if (!ownerUid || !charId || diaryText.length < 20) return
-      if (!window.callAI) return
-      if (!(await ldAutoEnabled(ownerUid, charId))) return
+      if (diaryText.length < 20) { await ldSaveCheck(ownerUid, charId, 'skip', '日记内容太短'); return }
+      if (!window.callAI) { await ldSaveCheck(ownerUid, charId, 'skip', 'API 未配置'); return }
+      if (!(await ldAutoEnabled(ownerUid, charId))) { await ldSaveCheck(ownerUid, charId, 'off', ''); return }
 
       const ts = Number(opts?.createdAt) || Date.now()
       const today = ldDayOf(ts)
       const events = await ldLoad(ownerUid, charId)
-      // 同一天角色最多自己记一件，已经记过就不再调用 AI
-      if (events.some(e => e.authorType === 'role' && ldDayOf(e.createdAt) === today)) return
+      // 同一天角色最多自己记一件，已经记过就不再调用 AI（手动“检定一次”时不受这条限制）
+      if (!opts?.force && events.some(e => e.authorType === 'role' && ldDayOf(e.createdAt) === today)) {
+        await ldSaveCheck(ownerUid, charId, 'skip', '这一天 TA 已经自己记过一件事了')
+        return
+      }
 
       const ctx = await ldCollectContext(ownerUid, charId, { date: today, text: '', notes: [], authorType: 'role' })
       const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
@@ -1106,18 +1174,27 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       }
       const raw = await window.callAI([{ role: 'user', content: parts.join('\n\n') }], callOpts)
       const answer = String(raw == null ? '' : raw).replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
-      const firstLine = answer.split('\n').map(s => s.trim()).find(Boolean) || ''
-      const m = firstLine.match(/^记\s*[｜|]\s*(\d+)\s*[｜|]\s*(.+)$/)
-      if (!m) return   // “无”或格式不对，一律当作不记
+      rawAnswer = answer
+      const lines = answer.split('\n').map(x => x.trim()).filter(Boolean)
+      const hit = lines.map(l => l.match(/^记\s*[｜|]\s*(\d+)\s*[｜|]\s*(.+)$/)).find(Boolean)
+      if (!hit) {
+        if (lines.some(l => /^无/.test(l))) {
+          await ldSaveCheck(ownerUid, charId, 'none', '', answer)
+        } else {
+          await ldSaveCheck(ownerUid, charId, 'format', '', answer)
+        }
+        return
+      }
 
-      const daysAgo = Math.min(7, Math.max(0, parseInt(m[1], 10) || 0))
+      const daysAgo = Math.min(7, Math.max(0, parseInt(hit[1], 10) || 0))
       const date = ldShiftDay(today, daysAgo)
-      const text = ldResolvePlaceholders(m[2], ctx).replace(/^["“「『]+|["”」』]+$/g, '').trim().slice(0, 60)
-      if (!text) return
+      const text = ldResolvePlaceholders(hit[2], ctx).replace(/^["“「『]+|["”」』]+$/g, '').trim().slice(0, 60)
+      if (!text) { await ldSaveCheck(ownerUid, charId, 'format', '', answer); return }
 
+      let added = false
       await ldUpdate(ownerUid, charId, list => {
         if (list.some(e => e.date === date && e.text === text)) return
-        if (list.some(e => e.authorType === 'role' && ldDayOf(e.createdAt) === today)) return
+        if (!opts?.force && list.some(e => e.authorType === 'role' && ldDayOf(e.createdAt) === today)) return
         list.push({
           id: ldMakeId('ev'),
           date,
@@ -1126,9 +1203,38 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
           createdAt: Date.now(),
           notes: []
         })
+        added = true
       })
+      await ldSaveCheck(ownerUid, charId, added ? 'recorded' : 'skip', added ? `${ldShortDay(date)} ${text}` : '和已有的事重复，没有重复记录', answer)
     } catch (e) {
       console.warn('[loveDiary] 日记联动失败：', e)
+      await ldSaveCheck(ownerUid, charId, 'error', e?.message || String(e), rawAnswer)
+    }
+  }
+
+  async function ldRunCheckNow(page, btn) {
+    const st = page._ld
+    if (!st || st.view !== 'timeline' || page._ldChecking) return
+    const post = ldLatestRoleDiary(st.ownerUid, st.charId)
+    if (!post) {
+      ldToast('这个角色还没有写过日记')
+      return
+    }
+    page._ldChecking = true
+    const html = btn.innerHTML
+    btn.disabled = true
+    btn.innerHTML = '检定中…'
+    try {
+      await ldAfterDiary({
+        ownerUid: st.ownerUid,
+        charId: st.charId,
+        diaryText: post.text,
+        createdAt: post.createdAt,
+        force: true
+      })
+    } finally {
+      page._ldChecking = false
+      if (document.body.contains(page)) await ldRenderTimeline(page)
     }
   }
 
@@ -1255,6 +1361,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
 
   window.LoveDiary = {
     afterDiaryGenerated: ldAfterDiary,
+    runCheckNow: ldRunCheckNow,
     dayOf: ldDayOf
   }
 })()
