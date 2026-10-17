@@ -6269,7 +6269,29 @@ function extractAIJson(text) {
 function _cleanThoughtDecor(s) {
   return (s || '').trim().replace(/^["'""''「」]+|["'""''「」]+$/g, '').trim()
 }
-
+// 模型有时会把特殊消息（引用 / 语音 / 位置等）和后面的普通话写在同一行，整行就被当成普通文字显示出来。
+// 这里在"一条完整的特殊消息"后面补一个换行，让它们各自成为独立的气泡。
+function _wcSeparateTrailingSpecialMessage(line) {
+  const s = String(line || '').trim()
+  if (!s.startsWith('[')) return s
+  let idx = s.indexOf(']')
+  while (idx !== -1) {
+    const tail = s.slice(idx + 1).trim()
+    if (!tail) return s
+    const head = s.slice(0, idx + 1)
+    // 括号必须成对（引用的原话或回复里可能自带 [笑] 这样的方括号）
+    const balanced = (head.match(/\[/g) || []).length === (head.match(/\]/g) || []).length
+    if (balanced && parseMsgType(head).type !== 'text') {
+      return head + '\n' + _wcSeparateTrailingSpecialMessage(tail)
+    }
+    idx = s.indexOf(']', idx + 1)
+  }
+  return s
+}
+ 
+function _wcSeparateSpecialMessages(reply) {
+  return String(reply || '').split(/\r?\n/).map(_wcSeparateTrailingSpecialMessage).join('\n')
+}
 function normalizeWechatAIFields(parsed) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('AI 返回格式异常，请重新发送一次')
@@ -6281,6 +6303,7 @@ function normalizeWechatAIFields(parsed) {
   let thought = typeof parsed.thought === 'string' ? parsed.thought : ''
   let status = typeof parsed.status === 'string' ? parsed.status : ''
   reply = reply.trim()
+  reply = _wcSeparateSpecialMessages(reply)
   thought = _cleanThoughtDecor(thought)
   status = status.trim().slice(0, 15)
   if (!reply) throw new Error('AI 返回格式异常，请重新发送一次')
