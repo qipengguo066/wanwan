@@ -811,6 +811,41 @@ html.has-android-bottom-inset .miss-compose {
   height: 14px;
 }
 
+.miss-record-delete-btn {
+  flex-shrink: 0;
+  color: var(--c-red);
+}
+
+.miss-record-delete-btn i,
+.miss-record-delete-btn svg {
+  font-size: 14px;
+  width: 14px;
+  height: 14px;
+}
+
+.miss-entry-resume {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: var(--c-accent-dark);
+  background: var(--c-surface-2);
+  font-size: 12px;
+  font-family: var(--font);
+  white-space: nowrap;
+}
+
+.miss-entry-resume:active {
+  opacity: 0.7;
+}
+
+.miss-summary-modal-message {
+  white-space: pre-line;
+}
+
 .miss-record-summary-btn:disabled,
 .miss-end-meet:disabled {
   opacity: 0.55;
