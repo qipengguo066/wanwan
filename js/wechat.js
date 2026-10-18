@@ -9704,59 +9704,88 @@ async function showCharThoughtsHistory(charId, chatId) {
     sheet.querySelector('#btn-thought-history').addEventListener('click', renderHistory)
     sheet.querySelector('#btn-thought-close').addEventListener('click', close)
   }
-  const renderHistory = async () => {
-    if (historyThoughts.length && (historyIndex < 0 || historyIndex >= historyThoughts.length)) {
-      historyIndex = historyThoughts.length - 1
+  // 历史卡片只渲染当前这张和前后各一张，避免一次性生成大量卡片（头像、模板 HTML）导致 iPhone 白屏
+  const buildHistorySlideInner = (m) => {
+    try {
+      return buildThoughtCardHTML(m, templateConfig, charName, char)
+    } catch (e) {
+      console.warn('[wechat] 心声历史卡片渲染失败', e)
+      return `<div class="thought-card-frame"><div class="thought-card-scroll"><div class="thought-card"><div class="thought-card-body">${wcEscHtml(m?.thought || '')}</div></div></div></div>`
     }
-    const favStates = await Promise.all(historyThoughts.map(m => isThoughtFavorited(m.id)))
-    const cardsHtml = historyThoughts.length
-      ? historyThoughts.map((m, i) => `<div class="thought-history-slide" data-slide-index="${i}">${buildThoughtCardHTML(m, templateConfig, charName, char)}</div>`).join('')
-      : '<div class="thought-history-empty">还没有历史心声</div>'
-    sheet.innerHTML = `
-      <div class="thought-history-panel">
-        <div class="thought-history-slider">${cardsHtml}</div>
-        <div class="thought-history-actions">
-          <button class="thought-round-btn" id="btn-thought-back" title="返回" aria-label="返回"><i class="fa-solid fa-right-from-bracket"></i></button>
-          ${historyThoughts.length ? buildThoughtFavBtnHTML(favStates[historyIndex] || false, 'btn-thought-hist-fav') : ''}
-          <button class="thought-round-btn thought-round-btn-danger" id="btn-thought-delete" title="删除" aria-label="删除" ${historyThoughts.length ? '' : 'disabled'}><i class="fa fa-trash"></i></button>
+  }
+  const renderHistory = async () => {
+    try {
+      if (historyThoughts.length && (historyIndex < 0 || historyIndex >= historyThoughts.length)) {
+        historyIndex = historyThoughts.length - 1
+      }
+      const currentFav = historyThoughts.length ? await isThoughtFavorited(historyThoughts[historyIndex].id) : false
+      const cardsHtml = historyThoughts.length
+        ? historyThoughts.map((m, i) => `<div class="thought-history-slide" data-slide-index="${i}">${Math.abs(i - historyIndex) <= 1 ? buildHistorySlideInner(m) : ''}</div>`).join('')
+        : '<div class="thought-history-empty">还没有历史心声</div>'
+      sheet.innerHTML = `
+        <div class="thought-history-panel">
+          <div class="thought-history-slider">${cardsHtml}</div>
+          <div class="thought-history-actions">
+            <button class="thought-round-btn" id="btn-thought-back" title="返回" aria-label="返回"><i class="fa-solid fa-right-from-bracket"></i></button>
+            ${historyThoughts.length ? buildThoughtFavBtnHTML(currentFav, 'btn-thought-hist-fav') : ''}
+            <button class="thought-round-btn thought-round-btn-danger" id="btn-thought-delete" title="删除" aria-label="删除" ${historyThoughts.length ? '' : 'disabled'}><i class="fa fa-trash"></i></button>
+          </div>
         </div>
-      </div>
-    `
-    const slider = sheet.querySelector('.thought-history-slider')
-    if (slider) {
-      slider.addEventListener('scroll', async () => {
-        const width = slider.clientWidth || 1
-        const newIndex = Math.max(0, Math.min(historyThoughts.length - 1, Math.round(Math.abs(slider.scrollLeft) / width)))
-        if (newIndex !== historyIndex) {
-          historyIndex = newIndex
-          const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
-          if (histFavBtn) {
-            const fav = await isThoughtFavorited(historyThoughts[historyIndex].id)
-            histFavBtn.className = `thought-round-btn ${fav ? 'thought-fav-active' : ''}`
-            histFavBtn.innerHTML = fav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+      `
+      const slider = sheet.querySelector('.thought-history-slider')
+      if (slider) {
+        // 去掉 rtl + 平滑滚动：iOS Safari 在弹窗里的 rtl 横向吸附滚动不稳定
+        slider.style.direction = 'ltr'
+        slider.style.scrollBehavior = 'auto'
+        if (historyThoughts.length) slider.scrollLeft = historyIndex * (slider.clientWidth || 0)
+        const fillSlides = () => {
+          for (let i = Math.max(0, historyIndex - 1); i <= Math.min(historyThoughts.length - 1, historyIndex + 1); i++) {
+            const slide = slider.querySelector(`.thought-history-slide[data-slide-index="${i}"]`)
+            if (slide && !slide.firstElementChild) slide.innerHTML = buildHistorySlideInner(historyThoughts[i])
           }
         }
-      })
-    }
-    const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
-    if (histFavBtn) {
-      histFavBtn.addEventListener('click', async () => {
+        let scrollTimer = null
+        slider.addEventListener('scroll', () => {
+          clearTimeout(scrollTimer)
+          scrollTimer = setTimeout(async () => {
+            const width = slider.clientWidth || 1
+            const newIndex = Math.max(0, Math.min(historyThoughts.length - 1, Math.round(Math.abs(slider.scrollLeft) / width)))
+            if (newIndex === historyIndex) return
+            historyIndex = newIndex
+            fillSlides()
+            const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
+            if (histFavBtn && historyThoughts[historyIndex]) {
+              const fav = await isThoughtFavorited(historyThoughts[historyIndex].id)
+              histFavBtn.className = `thought-round-btn ${fav ? 'thought-fav-active' : ''}`
+              histFavBtn.innerHTML = fav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+            }
+          }, 80)
+        })
+      }
+      const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
+      if (histFavBtn) {
+        histFavBtn.addEventListener('click', async () => {
+          const target = historyThoughts[historyIndex]
+          if (!target) return
+          const nowFav = await toggleThoughtFavorite(target, charName, char, templateConfig)
+          histFavBtn.className = `thought-round-btn ${nowFav ? 'thought-fav-active' : ''}`
+          histFavBtn.innerHTML = nowFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+        })
+      }
+      sheet.querySelector('#btn-thought-back').addEventListener('click', renderCurrent)
+      sheet.querySelector('#btn-thought-delete').addEventListener('click', async () => {
         const target = historyThoughts[historyIndex]
         if (!target) return
-        const nowFav = await toggleThoughtFavorite(target, charName, char, templateConfig)
-        histFavBtn.className = `thought-round-btn ${nowFav ? 'thought-fav-active' : ''}`
-        histFavBtn.innerHTML = nowFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+        await clearThoughtMessage(target.id, chatId)
+        historyThoughts = historyThoughts.filter(m => m.id !== target.id)
+        if (historyIndex >= historyThoughts.length) historyIndex = Math.max(0, historyThoughts.length - 1)
+        renderHistory()
       })
+    } catch (error) {
+      console.error('[wechat] 心声历史渲染失败', error)
+      window.toast && window.toast('历史心声加载失败：' + (error?.message || String(error)))
+      renderCurrent()
     }
-    sheet.querySelector('#btn-thought-back').addEventListener('click', renderCurrent)
-    sheet.querySelector('#btn-thought-delete').addEventListener('click', async () => {
-      const target = historyThoughts[historyIndex]
-      if (!target) return
-      await clearThoughtMessage(target.id, chatId)
-      historyThoughts = historyThoughts.filter(m => m.id !== target.id)
-      if (historyIndex >= historyThoughts.length) historyIndex = Math.max(0, historyThoughts.length - 1)
-      renderHistory()
-    })
   }
   renderCurrent()
   document.getElementById('app').appendChild(overlay)
