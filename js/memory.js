@@ -146,8 +146,143 @@
     var arousal = clamp(memory.arousal, 0, 1, 0)
     return Math.min(1, valence * 0.4 + arousal * 0.6)
   }
+// ===== 粘贴位置：memory.js 里，"async function getEmbeddingConfig() {" 这一行的正上方 =====
+// （旧的 getEmbeddingConfig 先不删，只把它的名字改成 getEmbeddingConfigOld，见说明）
 
-  async function getEmbeddingConfig() {
+// 向量专用 API：优先使用在记忆长廊里单独配置的；没配的话，退回旧的读取方式
+async function getEmbeddingConfig() {
+  var rows = await Promise.all([
+    db.config.get('embeddingApiBaseUrl'),
+    db.config.get('embeddingApiKey'),
+    db.config.get('embeddingApiModel')
+  ])
+  var own = {
+    url: rows[0] && rows[0].value || '',
+    key: rows[1] && rows[1].value || '',
+    model: rows[2] && rows[2].value || '',
+    source: '向量专用 API'
+  }
+  if (own.url && own.key && own.model) return own
+  return await getEmbeddingConfigOld()
+}
+
+// 向量 API 配置页
+async function openEmbeddingApiConfigPage(memoryPage) {
+  var oldPage = document.getElementById('memory-embedding-config-page')
+  if (oldPage) oldPage.remove()
+  var rows = await Promise.all([
+    db.config.get('embeddingApiBaseUrl'),
+    db.config.get('embeddingApiKey'),
+    db.config.get('embeddingApiModel')
+  ])
+  var cfg = {
+    url: rows[0] && rows[0].value || '',
+    key: rows[1] && rows[1].value || '',
+    model: rows[2] && rows[2].value || ''
+  }
+  var html = `
+    <div class="setting-section">
+      <div class="api-form memory-api-form">
+        <div class="memory-api-desc">
+          向量专用 API，只用来给记忆生成向量。需要支持 /embeddings 接口，填 embedding 模型（例如 qwen3-embedding-8b）。Base URL 一般以 /v1 结尾。
+        </div>
+        <label class="form-label">Base URL</label>
+        <input class="input-field" id="emb-api-base-url" placeholder="https://xxx.com/v1" value="${esc(cfg.url)}">
+        <label class="form-label">API Key</label>
+        <div class="input-with-toggle">
+          <input class="input-field" id="emb-api-key" type="password" autocomplete="off" placeholder="sk-..." value="${esc(cfg.key)}">
+          <button class="btn-text-toggle" id="emb-api-key-toggle" type="button">显示</button>
+        </div>
+        <label class="form-label">向量模型</label>
+        <input class="input-field" id="emb-api-model" placeholder="例如 qwen3-embedding-8b" value="${esc(cfg.model)}">
+        <button class="btn-pill btn-full" id="emb-api-save" type="button">保存并测试</button>
+        <button class="btn-ghost btn-full btn-text-danger memory-api-clear" id="emb-api-clear" type="button">清除配置</button>
+      </div>
+    </div>`
+  var page = buildSubPage('memory-embedding-config-page', '向量 API', html)
+  openSubPage(page)
+
+  var keyInput = page.querySelector('#emb-api-key')
+  var keyToggle = page.querySelector('#emb-api-key-toggle')
+  keyToggle.addEventListener('click', function() {
+    var hidden = keyInput.type === 'password'
+    keyInput.type = hidden ? 'text' : 'password'
+    keyToggle.textContent = hidden ? '隐藏' : '显示'
+  })
+  page.querySelector('#emb-api-save').addEventListener('click', async function(e) {
+    var btn = e.currentTarget
+    var url = String(page.querySelector('#emb-api-base-url').value || '').trim().replace(/\/+$/, '')
+    var key = String(keyInput.value || '').trim()
+    var model = String(page.querySelector('#emb-api-model').value || '').trim()
+    if (!url || !key || !model) { window.toast && window.toast('请把 Base URL、Key、模型都填上'); return }
+    btn.disabled = true
+    try {
+      await Promise.all([
+        db.config.put({ key: 'embeddingApiBaseUrl', value: url }),
+        db.config.put({ key: 'embeddingApiKey', value: key }),
+        db.config.put({ key: 'embeddingApiModel', value: model })
+      ])
+      await testEmbedding()
+      await renderMemoryPage(memoryPage)
+    } finally {
+      btn.disabled = false
+    }
+  })
+  page.querySelector('#emb-api-clear').addEventListener('click', async function() {
+    if (!confirm('清除向量专用 API 配置？')) return
+    await Promise.all([
+      db.config.delete('embeddingApiBaseUrl'),
+      db.config.delete('embeddingApiKey'),
+      db.config.delete('embeddingApiModel')
+    ])
+    page.querySelector('#emb-api-base-url').value = ''
+    keyInput.value = ''
+    page.querySelector('#emb-api-model').value = ''
+    window.toast && window.toast('已清除')
+    await renderMemoryPage(memoryPage)
+  })
+}
+
+// ===== 同样粘贴在 memory.js 里（放在上面两个函数的下面就行）：给旧记忆补算向量 =====
+// 只处理未归档、还没有向量的记忆；范围跟随当前页面选中的账号 / 角色。
+// 每条记忆请求一次向量接口；连续失败 3 次会自动停止，已算好的会保留。
+async function backfillEmbeddings(page, btn) {
+  var state = page._memoryState || {}
+  if (!state.ownerUid || page._memoryBackfilling) return
+  var rows = await db.memories.where('ownerUid').equals(state.ownerUid).filter(function(m) {
+    if (m.status === 'archived') return false
+    if (state.charId && parseInt(m.charId, 10) !== parseInt(state.charId, 10)) return false
+    return !Array.isArray(m.embedding) || !m.embedding.length
+  }).toArray()
+  if (!rows.length) { window.toast && window.toast('没有需要补算的记忆'); return }
+  if (!confirm('将给 ' + rows.length + ' 条记忆补算向量，每条会请求一次向量接口。继续？')) return
+  page._memoryBackfilling = true
+  var oldHtml = btn.innerHTML
+  btn.disabled = true
+  var done = 0
+  var failedInRow = 0
+  var lastError = ''
+  for (var i = 0; i < rows.length; i++) {
+    btn.textContent = '补算中 ' + (i + 1) + '/' + rows.length
+    try {
+      var emb = await createEmbedding(rows[i].title + '\n' + rows[i].content)
+      await db.memories.update(rows[i].id, { embedding: emb })
+      done++
+      failedInRow = 0
+    } catch (e) {
+      failedInRow++
+      lastError = e.message || String(e)
+      if (failedInRow >= 3) break
+    }
+  }
+  page._memoryBackfilling = false
+  btn.disabled = false
+  btn.innerHTML = oldHtml
+  window.toast && window.toast('已补算 ' + done + ' 条' + (failedInRow >= 3 ? '，连续失败已停止：' + lastError.slice(0, 80) : ''))
+  await renderMemoryPage(page)
+}
+
+  async function getEmbeddingConfigOld() {
     var rows = await Promise.all([
       db.config.get('subapiBaseUrl'), db.config.get('subapiKey'), db.config.get('subapiModel'),
       db.config.get('apiBaseUrl'), db.config.get('apiKey'), db.config.get('apiModel')
@@ -1054,7 +1189,7 @@ ${lines}`
             <div class="memory-panel-title">搜索与状态</div>
             <div class="memory-panel-sub">向量状态：${esc(embeddingText)} · 最近总结：${esc(formatTime(lastSummary))}</div>
           </div>
-          <button class="btn-ghost btn-sm" id="btn-memory-test-embedding">测试向量</button>
+        <span class="memory-panel-actions"><button class="btn-ghost btn-sm" id="btn-memory-embedding-config" type="button">向量 API</button><button class="btn-ghost btn-sm" id="btn-memory-test-embedding">测试向量</button></span>
         </div>
         <div class="memory-filter-grid memory-filter-grid-compact">
           <select class="input-field" id="memory-filter-status">
@@ -1158,6 +1293,9 @@ ${lines}`
         else page._memoryState.charId = parseInt(item.dataset.charId, 10) || 0
         renderMemoryPage(page)
       })
+    })
+        page.querySelector('#btn-memory-embedding-config')?.addEventListener('click', function() {
+      openEmbeddingApiConfigPage(page)
     })
     page.querySelector('#btn-memory-test-embedding')?.addEventListener('click', async function() {
       await testEmbedding()
