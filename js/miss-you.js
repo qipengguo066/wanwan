@@ -719,10 +719,22 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   async function addOfflineMessage(ownerUid, chatId, charId, mode, role, content) {
-    return await db.offlineChats.add({
+    const row = {
       ownerUid, chatId, charId, mode, role, content,
       createdAt: Date.now()
-    })
+    }
+    // 从旧存档节点重开的见面：新消息沿用原记录的时间线（上一条 +1 分钟），结束时归档时间也回到原来的时间
+    try {
+      const current = await getOfflineMessages(ownerUid, chatId, charId, mode)
+      const last = current[current.length - 1]
+      if (last && last.resumeEndedAt) {
+        row.createdAt = (Number(last.createdAt) || Date.now()) + 60 * 1000
+        row.resumeEndedAt = last.resumeEndedAt
+      }
+    } catch (error) {
+      console.warn('[miss-you] 读取上一条见面记录失败，使用当前时间:', error)
+    }
+    return await db.offlineChats.add(row)
   }
 
   async function refreshOfflineChat(page) {
@@ -771,8 +783,13 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     if (!action) return
     const char = await window.getCharacter(state.chat.charId)
     const display = await getWechatDisplayFor(state.ownerUid, char)
-    const endedAt = Date.now()
-    const sessionId = `meet_${state.ownerUid}_${state.chat.id}_${state.mode}_${endedAt}`
+    // 从旧存档重开的见面：归档时间回到原记录的时间（且不早于最后一条消息）；sessionId 加后缀，避免和原记录、旧记忆混在一起
+    const resumeRow = rows.find(m => m.resumeEndedAt)
+    const lastCreatedAt = Math.max(0, ...rows.map(m => Number(m.createdAt) || 0))
+    const endedAt = resumeRow
+      ? Math.max(Number(resumeRow.resumeEndedAt) || 0, lastCreatedAt + 1000)
+      : Date.now()
+    const sessionId = `meet_${state.ownerUid}_${state.chat.id}_${state.mode}_${endedAt}${resumeRow ? '_r' + Date.now() : ''}`
     const endedTitle = `${display.name} · ${state.mode === 'script' ? '剧本' : '见面'}`
     const settings = await getOfflineSettings(state.ownerUid, state.chat.id, state.mode)
     let summaryResult = null
@@ -804,15 +821,18 @@ ${MISS_BEAUTY_CLASS_TEXT}`
         }
       }
       const summarized = action === 'summary' && !summaryError && summaryResult?.ok
-      await db.offlineChats.bulkPut(rows.map(m => ({
-        ...m,
+      await db.offlineChats.bulkPut(rows.map(m => {
+        const { resumeEndedAt, ...rest } = m
+        return {
+        ...rest,
         sessionId,
         endedAt,
         endedTitle,
         sessionMaskUserId: settings.maskUserId,
         meetSummaryStatus: summarized ? 'summarized' : 'unsummarized',
         meetSummarizedAt: summarized ? Date.now() : null
-      })))
+        }
+      }))
       await refreshOfflineChat(page)
       if (summaryError) {
         window.toast('总结失败，见面已结束，可在过往记录中重新总结')
@@ -928,8 +948,10 @@ ${MISS_BEAUTY_CLASS_TEXT}`
           <div class="miss-msg-text">${content}</div>
           <div class="miss-entry-footer">
             <span>${myEsc(formatMeetTime(msg.createdAt))}</span>
-            <button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
-            <button type="button" class="miss-entry-delete" title="删除"><i class="fa-regular fa-trash-can"></i></button>
+            ${options.resumeButton
+              ? '<button type="button" class="miss-entry-resume" title="从这里重开"><i class="fa-solid fa-code-branch"></i><span>从这里重开</span></button>'
+              : `<button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
+            <button type="button" class="miss-entry-delete" title="删除"><i class="fa-regular fa-trash-can"></i></button>`}
           </div>
         </div>
       </article>`
@@ -1906,12 +1928,59 @@ ${memoryCtx}`
         <button class="header-back" id="miss-record-back"><i class="fa fa-angle-left"></i></button>
         <span class="header-title">${myEsc(formatMeetTime(record.endedAt))}</span>
         ${record.summarized ? '' : '<button class="btn-icon miss-record-summary-btn" id="miss-record-summary" type="button" title="总结此次见面" aria-label="总结此次见面"><i class="fa-solid fa-wand-magic-sparkles"></i></button>'}
+        <button class="btn-icon miss-record-delete-btn" id="miss-record-delete" type="button" title="删除此记录" aria-label="删除此记录"><i class="fa-regular fa-trash-can"></i></button>
       </div>
       <div class="miss-record-detail">
-        ${record.messages.map((m, i) => buildOfflineMsgHTML(m, userDisplay, display, i, settings)).join('')}
+        ${record.messages.map((m, i) => buildOfflineMsgHTML(m, userDisplay, display, i, settings, { resumeButton: true })).join('')}
       </div>
     `
     page.querySelector('#miss-record-back').addEventListener('click', () => window.closePage('miss-you-record-page'))
+    page.querySelector('#miss-record-delete').addEventListener('click', async () => {
+      const choice = await showMeetChoiceModal({
+        title: '删除这条见面记录？',
+        message: `将删除这 ${record.count} 条见面记录，以及这次见面生成的长期记忆（如果有）。删除后无法恢复。`,
+        buttons: [{ value: 'delete', label: '确认删除', primary: true }]
+      })
+      if (choice !== 'delete') return
+      try {
+        await deleteMeetRecord(ownerUid, chat, record)
+        window.closePage('miss-you-record-page')
+        await refreshMeetRecordList(recordListPage, ownerUid, chat, mode)
+        window.toast('已删除这条见面记录')
+      } catch (error) {
+        console.error('[miss-you] 删除见面记录失败:', error)
+        window.toast('删除失败：' + (error?.message || String(error)))
+      }
+    })
+    page.querySelectorAll('.miss-entry-resume').forEach(btn => {
+      btn.addEventListener('click', async event => {
+        event.stopPropagation()
+        const id = parseInt(btn.closest('.miss-entry')?.dataset.msgId, 10)
+        const nodeIndex = record.messages.findIndex(m => m.id === id)
+        if (nodeIndex < 0) return
+        const choice = await showMeetChoiceModal({
+          title: '从这条重新开始？',
+          message: `将保留这条（含）之前的 ${nodeIndex + 1} 条内容，之后的内容重新写。时间沿用原记录。\n\n覆盖：删除原记录和它生成的长期记忆。\n另存：原记录保留，但前半段会在新旧两份里各有一份，线上聊天和日记会读到重复内容，确认不要原记录后建议删除它。`,
+          buttons: [
+            { value: 'overwrite', label: '覆盖原记录并重开', primary: true },
+            { value: 'branch', label: '另存为新分支（保留原记录）' }
+          ]
+        })
+        if (!choice) return
+        try {
+          const ok = await resumeMeetFromNode(ownerUid, chat, mode, record, nodeIndex, choice === 'overwrite')
+          if (!ok) return
+          window.closePage('miss-you-record-page')
+          window.closePage('miss-you-settings-page')
+          const missPage = document.getElementById('miss-you-page')
+          if (missPage) await refreshOfflineChat(missPage)
+          window.toast(choice === 'overwrite' ? '已覆盖并回到这个节点，可以继续写了' : '已另存为新分支，可以继续写了')
+        } catch (error) {
+          console.error('[miss-you] 从存档重开失败:', error)
+          window.toast('重开失败：' + (error?.message || String(error)))
+        }
+      })
+    })
     page.querySelector('#miss-record-summary')?.addEventListener('click', async event => {
       const button = event.currentTarget
       const pendingKey = `record:${record.sessionId}`
@@ -1949,6 +2018,55 @@ ${memoryCtx}`
       }
     })
     window.openPage(page)
+  }
+
+  // 删除一条见面记录：同时清掉它生成的长期记忆和总结记录，避免角色还"记得"
+  async function deleteMeetRecord(ownerUid, chat, record) {
+    const ids = record.messages.map(m => m.id).filter(Boolean)
+    await removeMeetSessionMemories(ownerUid, chat.id, chat.charId, record.sessionId)
+    if (ids.length) await db.offlineChats.bulkDelete(ids)
+  }
+
+  async function removeMeetSessionMemories(ownerUid, chatId, charId, sessionId) {
+    if (!sessionId) return
+    if (db.memories) {
+      await db.memories.where('chatId').equals(chatId).filter(m =>
+        m.ownerUid === ownerUid && m.charId === charId && m.sourceSessionId === sessionId
+      ).delete()
+    }
+    if (db.memoryRuns) {
+      await db.memoryRuns.where('chatId').equals(chatId).filter(r =>
+        r.ownerUid === ownerUid && r.charId === charId && r.sourceSessionId === sessionId
+      ).delete()
+    }
+  }
+
+  // 从已结束记录的某个节点重开：保留该节点（含）之前的内容，作为新的进行中见面继续写
+  async function resumeMeetFromNode(ownerUid, chat, mode, record, nodeIndex, overwrite) {
+    const key = pendingKey(ownerUid, chat.id, mode)
+    if (_missYouPending.has(key) || _missSummaryPending.has(key) || _missEndModalPending.has(key)) {
+      window.toast('当前正在生成或总结，稍后再试')
+      return false
+    }
+    const current = await getOfflineMessages(ownerUid, chat.id, chat.charId, mode)
+    if (current.length) {
+      window.toast('当前有未结束的见面，请先回到见面页结束或清空后再重开')
+      return false
+    }
+    const keep = record.messages.slice(0, nodeIndex + 1)
+    if (!keep.length) return false
+    const resumeEndedAt = Number(record.endedAt) || Date.now()
+    const rows = keep.map(m => {
+      const {
+        id, sessionId, endedAt, endedTitle, sessionMaskUserId,
+        meetSummaryStatus, meetSummarizedAt, ...rest
+      } = m
+      return { ...rest, resumeEndedAt }
+    })
+    // 先写入新的进行中记录，再删除原记录，中途失败也不会丢数据
+    await db.offlineChats.bulkAdd(rows)
+    if (overwrite) await deleteMeetRecord(ownerUid, chat, record)
+    return true
   }
 
   async function refreshMeetRecordList(page, ownerUid, chat, mode) {

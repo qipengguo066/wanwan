@@ -6171,7 +6171,56 @@ function _wcRegexSalvageFields(text) {
 function _wcStripCodeFences(s) {
   return s.replace(/```[a-z]*\s*\n?/gi, '').replace(/```/g, '').trim()
 }
-
+// 修复 JSON 字符串里未转义的英文双引号（角色用 [引用"我：原话"并回复：…] 格式时极易出现）、
+// 裸换行、尾逗号，并补全被截断的结尾；顶层对象结束后的多余文字会被丢掉
+function _wcRepairInnerQuotes(text) {
+  const start = text.indexOf('{')
+  if (start < 0) return null
+  let out = ''
+  let inString = false
+  let escaped = false
+  const stack = []
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue }
+      if (ch === '\\') { out += ch; escaped = true; continue }
+      if (ch === '"') {
+        // 引号后面第一个非空白字符是 : } ] 或者 ", 下一个键/值" 时，才算字符串真正结束
+        let j = i + 1
+        while (j < text.length && /\s/.test(text[j])) j++
+        const nx = text[j]
+        let isEnd = nx === undefined || nx === ':' || nx === '}' || nx === ']'
+        if (!isEnd && nx === ',') {
+          let k = j + 1
+          while (k < text.length && /\s/.test(text[k])) k++
+          isEnd = k >= text.length || /["{\[\]}]/.test(text[k])
+        }
+        if (isEnd) { inString = false; out += ch } else { out += '\\"' }
+        continue
+      }
+      if (ch === '\n') { out += '\\n'; continue }
+      if (ch === '\r') continue
+      if (ch === '\t') { out += '\\t'; continue }
+      if (ch.charCodeAt(0) < 0x20) continue
+      out += ch
+      continue
+    }
+    if (ch === '"') { inString = true; out += ch; continue }
+    if (ch === '{' || ch === '[') { stack.push(ch); out += ch; continue }
+    if (ch === '}' || ch === ']') {
+      stack.pop()
+      out += ch
+      if (!stack.length) break
+      continue
+    }
+    out += ch
+  }
+  if (inString) out += '"'
+  out = out.replace(/[\s,:]+$/, '')
+  while (stack.length) out += stack.pop() === '{' ? '}' : ']'
+  return out.replace(/,\s*([}\]])/g, '$1')
+}
 function extractAIJson(text) {
   if (!text) return null
   const s = text.trim()
@@ -6188,6 +6237,14 @@ function extractAIJson(text) {
     candidates.push(inner)
   }
   candidates.push(s)
+ 
+  // 2.5 字符串里有未转义的英文双引号（引用原话时常见）→ 修复后再解析，避免被后面的“正则抢救”截断
+  for (const cand of candidates) {
+    const fixed = _wcRepairInnerQuotes(cand)
+    const o = fixed && _tryParseJsonObject(fixed)
+    if (o) return o
+  }
+
   // 3-5. 括号配对提取 → 修复重试 → 截断补全
   for (const cand of candidates) {
     const sliced = _wcSliceJsonObject(cand)
@@ -6212,7 +6269,29 @@ function extractAIJson(text) {
 function _cleanThoughtDecor(s) {
   return (s || '').trim().replace(/^["'""''「」]+|["'""''「」]+$/g, '').trim()
 }
-
+// 模型有时会把特殊消息（引用 / 语音 / 位置等）和后面的普通话写在同一行，整行就被当成普通文字显示出来。
+// 这里在"一条完整的特殊消息"后面补一个换行，让它们各自成为独立的气泡。
+function _wcSeparateTrailingSpecialMessage(line) {
+  const s = String(line || '').trim()
+  if (!s.startsWith('[')) return s
+  let idx = s.indexOf(']')
+  while (idx !== -1) {
+    const tail = s.slice(idx + 1).trim()
+    if (!tail) return s
+    const head = s.slice(0, idx + 1)
+    // 括号必须成对（引用的原话或回复里可能自带 [笑] 这样的方括号）
+    const balanced = (head.match(/\[/g) || []).length === (head.match(/\]/g) || []).length
+    if (balanced && parseMsgType(head).type !== 'text') {
+      return head + '\n' + _wcSeparateTrailingSpecialMessage(tail)
+    }
+    idx = s.indexOf(']', idx + 1)
+  }
+  return s
+}
+ 
+function _wcSeparateSpecialMessages(reply) {
+  return String(reply || '').split(/\r?\n/).map(_wcSeparateTrailingSpecialMessage).join('\n')
+}
 function normalizeWechatAIFields(parsed) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('AI 返回格式异常，请重新发送一次')
@@ -6224,6 +6303,7 @@ function normalizeWechatAIFields(parsed) {
   let thought = typeof parsed.thought === 'string' ? parsed.thought : ''
   let status = typeof parsed.status === 'string' ? parsed.status : ''
   reply = reply.trim()
+  reply = _wcSeparateSpecialMessages(reply)
   thought = _cleanThoughtDecor(thought)
   status = status.trim().slice(0, 15)
   if (!reply) throw new Error('AI 返回格式异常，请重新发送一次')
@@ -7768,14 +7848,14 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
   const loreAfterBlock = loreSeg.after
     ? `# 【补充世界观设定】\n${loreSeg.after}\n\n---\n\n`
     : ''
-  let system = buildSystemPart5(charName, userName, thoughtTemplate) +
+    let system = buildSystemPart5(charName, userName, thoughtTemplate) +
     buildSystemBilingualPart(bilingualSettings) +
     buildSystemPart1(char, charName, loreSeg.middle, loreSeg.before) +
-    buildSystemMemoryPart(memoryCtx) +
-    part2 +
     loreAfterBlock +
     buildSystemPart3(charName, userName, stickerNames, imageGenEnabled) +
-    buildSystemPart4(charName, userName)
+    buildSystemPart4(charName, userName) +
+    buildSystemMemoryPart(memoryCtx) +
+    part2
 
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
@@ -9624,59 +9704,88 @@ async function showCharThoughtsHistory(charId, chatId) {
     sheet.querySelector('#btn-thought-history').addEventListener('click', renderHistory)
     sheet.querySelector('#btn-thought-close').addEventListener('click', close)
   }
-  const renderHistory = async () => {
-    if (historyThoughts.length && (historyIndex < 0 || historyIndex >= historyThoughts.length)) {
-      historyIndex = historyThoughts.length - 1
+  // 历史卡片只渲染当前这张和前后各一张，避免一次性生成大量卡片（头像、模板 HTML）导致 iPhone 白屏
+  const buildHistorySlideInner = (m) => {
+    try {
+      return buildThoughtCardHTML(m, templateConfig, charName, char)
+    } catch (e) {
+      console.warn('[wechat] 心声历史卡片渲染失败', e)
+      return `<div class="thought-card-frame"><div class="thought-card-scroll"><div class="thought-card"><div class="thought-card-body">${wcEscHtml(m?.thought || '')}</div></div></div></div>`
     }
-    const favStates = await Promise.all(historyThoughts.map(m => isThoughtFavorited(m.id)))
-    const cardsHtml = historyThoughts.length
-      ? historyThoughts.map((m, i) => `<div class="thought-history-slide" data-slide-index="${i}">${buildThoughtCardHTML(m, templateConfig, charName, char)}</div>`).join('')
-      : '<div class="thought-history-empty">还没有历史心声</div>'
-    sheet.innerHTML = `
-      <div class="thought-history-panel">
-        <div class="thought-history-slider">${cardsHtml}</div>
-        <div class="thought-history-actions">
-          <button class="thought-round-btn" id="btn-thought-back" title="返回" aria-label="返回"><i class="fa-solid fa-right-from-bracket"></i></button>
-          ${historyThoughts.length ? buildThoughtFavBtnHTML(favStates[historyIndex] || false, 'btn-thought-hist-fav') : ''}
-          <button class="thought-round-btn thought-round-btn-danger" id="btn-thought-delete" title="删除" aria-label="删除" ${historyThoughts.length ? '' : 'disabled'}><i class="fa fa-trash"></i></button>
+  }
+  const renderHistory = async () => {
+    try {
+      if (historyThoughts.length && (historyIndex < 0 || historyIndex >= historyThoughts.length)) {
+        historyIndex = historyThoughts.length - 1
+      }
+      const currentFav = historyThoughts.length ? await isThoughtFavorited(historyThoughts[historyIndex].id) : false
+      const cardsHtml = historyThoughts.length
+        ? historyThoughts.map((m, i) => `<div class="thought-history-slide" data-slide-index="${i}">${Math.abs(i - historyIndex) <= 1 ? buildHistorySlideInner(m) : ''}</div>`).join('')
+        : '<div class="thought-history-empty">还没有历史心声</div>'
+      sheet.innerHTML = `
+        <div class="thought-history-panel">
+          <div class="thought-history-slider">${cardsHtml}</div>
+          <div class="thought-history-actions">
+            <button class="thought-round-btn" id="btn-thought-back" title="返回" aria-label="返回"><i class="fa-solid fa-right-from-bracket"></i></button>
+            ${historyThoughts.length ? buildThoughtFavBtnHTML(currentFav, 'btn-thought-hist-fav') : ''}
+            <button class="thought-round-btn thought-round-btn-danger" id="btn-thought-delete" title="删除" aria-label="删除" ${historyThoughts.length ? '' : 'disabled'}><i class="fa fa-trash"></i></button>
+          </div>
         </div>
-      </div>
-    `
-    const slider = sheet.querySelector('.thought-history-slider')
-    if (slider) {
-      slider.addEventListener('scroll', async () => {
-        const width = slider.clientWidth || 1
-        const newIndex = Math.max(0, Math.min(historyThoughts.length - 1, Math.round(Math.abs(slider.scrollLeft) / width)))
-        if (newIndex !== historyIndex) {
-          historyIndex = newIndex
-          const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
-          if (histFavBtn) {
-            const fav = await isThoughtFavorited(historyThoughts[historyIndex].id)
-            histFavBtn.className = `thought-round-btn ${fav ? 'thought-fav-active' : ''}`
-            histFavBtn.innerHTML = fav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+      `
+      const slider = sheet.querySelector('.thought-history-slider')
+      if (slider) {
+        // 去掉 rtl + 平滑滚动：iOS Safari 在弹窗里的 rtl 横向吸附滚动不稳定
+        slider.style.direction = 'ltr'
+        slider.style.scrollBehavior = 'auto'
+        if (historyThoughts.length) slider.scrollLeft = historyIndex * (slider.clientWidth || 0)
+        const fillSlides = () => {
+          for (let i = Math.max(0, historyIndex - 1); i <= Math.min(historyThoughts.length - 1, historyIndex + 1); i++) {
+            const slide = slider.querySelector(`.thought-history-slide[data-slide-index="${i}"]`)
+            if (slide && !slide.firstElementChild) slide.innerHTML = buildHistorySlideInner(historyThoughts[i])
           }
         }
-      })
-    }
-    const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
-    if (histFavBtn) {
-      histFavBtn.addEventListener('click', async () => {
+        let scrollTimer = null
+        slider.addEventListener('scroll', () => {
+          clearTimeout(scrollTimer)
+          scrollTimer = setTimeout(async () => {
+            const width = slider.clientWidth || 1
+            const newIndex = Math.max(0, Math.min(historyThoughts.length - 1, Math.round(Math.abs(slider.scrollLeft) / width)))
+            if (newIndex === historyIndex) return
+            historyIndex = newIndex
+            fillSlides()
+            const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
+            if (histFavBtn && historyThoughts[historyIndex]) {
+              const fav = await isThoughtFavorited(historyThoughts[historyIndex].id)
+              histFavBtn.className = `thought-round-btn ${fav ? 'thought-fav-active' : ''}`
+              histFavBtn.innerHTML = fav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+            }
+          }, 80)
+        })
+      }
+      const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
+      if (histFavBtn) {
+        histFavBtn.addEventListener('click', async () => {
+          const target = historyThoughts[historyIndex]
+          if (!target) return
+          const nowFav = await toggleThoughtFavorite(target, charName, char, templateConfig)
+          histFavBtn.className = `thought-round-btn ${nowFav ? 'thought-fav-active' : ''}`
+          histFavBtn.innerHTML = nowFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+        })
+      }
+      sheet.querySelector('#btn-thought-back').addEventListener('click', renderCurrent)
+      sheet.querySelector('#btn-thought-delete').addEventListener('click', async () => {
         const target = historyThoughts[historyIndex]
         if (!target) return
-        const nowFav = await toggleThoughtFavorite(target, charName, char, templateConfig)
-        histFavBtn.className = `thought-round-btn ${nowFav ? 'thought-fav-active' : ''}`
-        histFavBtn.innerHTML = nowFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+        await clearThoughtMessage(target.id, chatId)
+        historyThoughts = historyThoughts.filter(m => m.id !== target.id)
+        if (historyIndex >= historyThoughts.length) historyIndex = Math.max(0, historyThoughts.length - 1)
+        renderHistory()
       })
+    } catch (error) {
+      console.error('[wechat] 心声历史渲染失败', error)
+      window.toast && window.toast('历史心声加载失败：' + (error?.message || String(error)))
+      renderCurrent()
     }
-    sheet.querySelector('#btn-thought-back').addEventListener('click', renderCurrent)
-    sheet.querySelector('#btn-thought-delete').addEventListener('click', async () => {
-      const target = historyThoughts[historyIndex]
-      if (!target) return
-      await clearThoughtMessage(target.id, chatId)
-      historyThoughts = historyThoughts.filter(m => m.id !== target.id)
-      if (historyIndex >= historyThoughts.length) historyIndex = Math.max(0, historyThoughts.length - 1)
-      renderHistory()
-    })
   }
   renderCurrent()
   document.getElementById('app').appendChild(overlay)
@@ -19939,6 +20048,42 @@ function appendCallUserBubble(page, text) {
   const conversation = page.querySelector('#call-conversation')
   if (conversation) conversation.scrollTop = conversation.scrollHeight
 }
+// 通话里“对方正在回复”的三点跳动占位（样式由 JS 自带，不用改 CSS 文件）
+function ensureCallTypingStyle() {
+  if (document.getElementById('call-typing-style')) return
+  const style = document.createElement('style')
+  style.id = 'call-typing-style'
+  style.textContent = `
+    .call-typing-dots { display: inline-flex; align-items: center; gap: 5px; min-height: 20px; }
+    .call-typing-dots i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.45; animation: call-typing-bounce 1.2s infinite ease-in-out; }
+    .call-typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+    .call-typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes call-typing-bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-4px); opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) { .call-typing-dots i { animation: none; opacity: 0.8; } }
+  `
+  document.head.appendChild(style)
+}
+
+function showCallTypingIndicator(page) {
+  const container = page?.querySelector('#call-messages')
+  if (!container) return null
+  ensureCallTypingStyle()
+  const el = document.createElement('div')
+  el.className = 'call-msg call-msg-assistant call-msg-typing'
+  el.innerHTML = '<span class="call-msg-text call-typing-dots"><i></i><i></i><i></i></span>'
+  container.appendChild(el)
+  const conversation = page.querySelector('#call-conversation')
+  if (conversation) conversation.scrollTop = conversation.scrollHeight
+  return el
+}
+
+function removeCallTypingIndicator(el) {
+  if (el && el.parentNode) el.remove()
+}
+
 
 async function sendCallAIRequest(page) {
   if (_callAISending) return
@@ -19946,7 +20091,7 @@ async function sendCallAIRequest(page) {
 
   const statusEl = page.querySelector('#call-status')
   const prevStatus = statusEl?.textContent || ''
-
+  let typingEl = null
   try {
     if (_callState === 'connecting') {
       updateCallStatus(page, '正在等待接听...')
@@ -19968,14 +20113,15 @@ async function sendCallAIRequest(page) {
         }
       }
     }
-
+    typingEl = showCallTypingIndicator(page)
     const raw = await window.callAI(messages, {
       system: _callSystemPrompt,
       responseFormat: 'json_object',
       responseJsonSchema: CALL_AI_JSON_SCHEMA,
       temperature: await window.getAITemperaturePreset('wechatCall')
     })
-
+    removeCallTypingIndicator(typingEl)
+    typingEl = null
     if (_callState === 'idle') return
 
     const parsed = extractCallJson(raw)
@@ -20006,6 +20152,7 @@ async function sendCallAIRequest(page) {
     }
     window.toast?.('通话出错：' + (e.message || '').slice(0, 100))
   } finally {
+        removeCallTypingIndicator(typingEl)
     _callAISending = false
   }
 }

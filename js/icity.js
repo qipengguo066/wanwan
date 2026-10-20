@@ -772,8 +772,9 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       err.rawOutput = text
       throw err
     }
+
     const posts = loadICityPosts(ctx.ownerUid)
-    posts.unshift({
+    const newPost = {
       id: makeICityId('post'),
       text: diary,
       createdAt: Date.now(),
@@ -781,8 +782,10 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       authorId: ctx.friendId,
       liked: false,
       notes: []
-    })
+    }
+    posts.unshift(newPost)
     saveICityPosts(ctx.ownerUid, posts)
+    return newPost
   }
 
   function parseICityNoteLines(raw) {
@@ -893,7 +896,8 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
         [{ role: 'user', content: prompt.userPrompt }],
         { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary') }
       )
-      applyICityDiary(ctx, cleanICityDiaryText(raw))
+            const newPost = applyICityDiary(ctx, cleanICityDiaryText(raw))
+      window.LoveDiary?.afterDiaryGenerated({ ownerUid: ctx.ownerUid, charId: ctx.friendId, diaryText: newPost.text, createdAt: newPost.createdAt })
       pending?.remove()
       await renderICityHome(page)
       showICityTopMessagePopup({
@@ -1310,7 +1314,151 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     await renderICityHome(page)
   }
 
-  function showICityPostMoreMenu(anchorEl, page, detail, post) {
+  // 日记备份码：把一篇日记（含小纸条）变成一段文字，方便从本地测试版搬到正式版
+function icityEncodeBackup(post) {
+  const data = {
+    v: 1,
+    post: {
+      id: post.id,
+      text: post.text,
+      createdAt: post.createdAt,
+      authorType: post.authorType,
+      authorId: post.authorId == null ? null : post.authorId,
+      liked: !!post.liked,
+      notes: Array.isArray(post.notes) ? post.notes : []
+    }
+  }
+  return 'WWICITY1:' + btoa(unescape(encodeURIComponent(JSON.stringify(data))))
+}
+
+function icityDecodeBackup(code) {
+  const m = String(code || '').replace(/\s+/g, '').match(/^WWICITY1:([A-Za-z0-9+/=]+)$/)
+  if (!m) return null
+  try {
+    const data = JSON.parse(decodeURIComponent(escape(atob(m[1]))))
+    return data && data.post && typeof data.post.text === 'string' ? data.post : null
+  } catch (_) {
+    return null
+  }
+}
+
+// 导入备份码：成功返回 true
+async function importICityBackup(page) {
+  const ownerUid = page?._icityState?.ownerUid
+  if (!ownerUid) return false
+  const code = window.prompt('粘贴要导入的日记备份码')
+  if (code == null || !String(code).trim()) return false
+  const post = icityDecodeBackup(code)
+  if (!post) {
+    window.toast?.('备份码无效，请确认复制完整')
+    return false
+  }
+  const posts = loadICityPosts(ownerUid)
+  const createdAt = Number(post.createdAt) || Date.now()
+  if (posts.some(p => String(p.id) === String(post.id) || (p.createdAt === createdAt && p.text === post.text))) {
+    window.toast?.('这篇日记已经存在')
+    return false
+  }
+  const isRole = post.authorType === 'role'
+  let missingChar = false
+  if (isRole) {
+    const char = post.authorId ? await db.characters.get(Number(post.authorId)) : null
+    missingChar = !char
+  }
+  posts.unshift({
+    id: post.id || makeICityId('post'),
+    text: String(post.text),
+    createdAt,
+    ownerUid: Number(ownerUid),
+    authorType: isRole ? 'role' : 'self',
+    authorId: isRole ? (Number(post.authorId) || null) : undefined,
+    liked: !!post.liked,
+    notes: Array.isArray(post.notes) ? post.notes : []
+  })
+  saveICityPosts(ownerUid, posts)
+  window.toast?.(missingChar ? '已导入，但找不到对应的角色，作者会显示为“好友”' : '日记已导入')
+  return true
+}
+
+// 编辑日记正文（角色写的、自己写的都可以改）
+function showICityEditPost(page, detail, post) {
+  if (document.getElementById('icity-note-modal')) return
+  const overlay = document.createElement('div')
+  overlay.className = 'sheet-overlay icity-note-overlay'
+  overlay.id = 'icity-note-overlay'
+  const modal = document.createElement('div')
+  modal.className = 'center-modal icity-note-modal'
+  modal.id = 'icity-note-modal'
+  modal.innerHTML = `
+    <div class="icity-note-modal-title">编辑日记</div>
+    <textarea class="icity-note-input" style="min-height:260px" placeholder="日记内容"></textarea>
+    <div class="icity-note-actions">
+      <button class="icity-note-cancel" type="button">取消</button>
+      <button class="icity-note-send" type="button">保存</button>
+    </div>
+  `
+  const app = document.getElementById('app') || document.body
+  app.appendChild(overlay)
+  app.appendChild(modal)
+  requestAnimationFrame(() => {
+    overlay.classList.add('show')
+    modal.classList.add('show')
+  })
+  const close = () => {
+    overlay.classList.remove('show')
+    modal.classList.remove('show')
+    setTimeout(() => {
+      overlay.remove()
+      modal.remove()
+    }, 220)
+  }
+  const input = modal.querySelector('.icity-note-input')
+  input.value = post.text || ''
+  overlay.addEventListener('click', close)
+  modal.querySelector('.icity-note-cancel').addEventListener('click', close)
+  modal.querySelector('.icity-note-send').addEventListener('click', async () => {
+    const text = input.value.trim()
+    if (!text) {
+      window.toast?.('日记不能为空')
+      return
+    }
+    const ownerUid = page?._icityState?.ownerUid
+    const updated = updateICityPost(ownerUid, post.id, post.createdAt, item => ({ ...item, text }))
+    close()
+    if (!updated) return
+    await renderICityPostDetailBody(page, detail, updated)
+    await renderICityHome(page)
+    window.toast?.('日记已修改')
+  })
+}
+
+// 详情页右下角“···”菜单：编辑 / 复制备份码 / 删除
+function showICityPostMoreMenu(anchorEl, page, detail, post) {
+  closeICityActionMenus()
+  const menu = document.createElement('div')
+  menu.className = 'icity-action-menu icity-more-menu'
+  menu.innerHTML = `
+    <button type="button" data-action="edit"><i class="fa fa-pen"></i><span>编辑</span></button>
+    <button type="button" data-action="backup"><i class="fa fa-copy"></i><span>复制备份码</span></button>
+    <button type="button" data-action="delete"><i class="fa fa-trash"></i><span>删除</span></button>`
+  ;(document.getElementById('app') || document.body).appendChild(menu)
+  positionICityActionMenu(menu, anchorEl)
+  menu.querySelector('[data-action="edit"]').addEventListener('click', () => {
+    menu.remove()
+    showICityEditPost(page, detail, post)
+  })
+  menu.querySelector('[data-action="backup"]').addEventListener('click', async () => {
+    menu.remove()
+    await copyICityNote(icityEncodeBackup(post))
+  })
+  menu.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+    menu.remove()
+    await deleteICityPost(page, detail, post)
+  })
+  setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 100)
+}
+
+  function showICityPostMoreMenuOld(anchorEl, page, detail, post) {
     closeICityActionMenus()
     const menu = document.createElement('div')
     menu.className = 'icity-action-menu icity-more-menu'
@@ -1583,6 +1731,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       </div>
       <div class="icity-compose-footer">
         <span class="icity-compose-hint"><i class="fa-solid fa-feather-pointed"></i> 日记·iCity</span>
+        <button class="icity-compose-import" type="button" style="margin-left:auto;border:none;background:transparent;color:#85ACDF;font-size:12px;cursor:pointer">导入备份码</button>
       </div>
     `
     window.openPage(compose)
@@ -1600,7 +1749,17 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     compose.querySelector('.icity-compose-cancel').addEventListener('click', () => {
       window.closePage('icity-compose')
     })
-
+    compose.querySelector('.icity-compose-import')?.addEventListener('click', async () => {
+      const ok = await importICityBackup(page)
+      if (!ok) return
+      window.closePage('icity-compose')
+      const footer = page.querySelector('#icity-footer')
+      if (footer) {
+        footer.querySelectorAll('.icity-tab-home, .icity-tab-profile')
+          .forEach(el => el.classList.toggle('active', el.classList.contains('icity-tab-home')))
+      }
+      renderICityHome(page)
+    })
     sendBtn.addEventListener('click', () => {
       const text = input.value.trim()
       if (!text) return
