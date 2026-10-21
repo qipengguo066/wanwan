@@ -51,7 +51,7 @@
       label: '消息正文与状态',
       items: [
         '.miss-entry-card', '.miss-msg-text', '.miss-msg-text p', '.miss-quote-highlight',
-        '.miss-entry-footer', '.miss-entry-more', '.miss-entry-delete',
+        '.miss-entry-footer', '.miss-entry-speak', '.miss-entry-more', '.miss-entry-delete',
         '.miss-status-card', '.miss-status-card-title', '.miss-status-row',
         '.miss-status-row span', '.miss-status-row strong',
         '.miss-typing-dots', '.miss-typing-dots span'
@@ -919,7 +919,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const name = isUser ? userDisplay.name : display.name
     const avatar = isUser ? userDisplay.avatar : display.avatar
     const parsed = parseMissStatus(msg.content || '', settings)
-    const content = formatOfflineContent(parsed.status ? parsed.text : (msg.content || ''))
+    const content = formatOfflineContent(stripOfflineTags(stripOfflineLabel(parsed.status ? parsed.text : (msg.content || ''))))
     const useConfiguredSubtitles = options.useConfiguredSubtitles === true
     const subtitle = isUser
       ? (useConfiguredSubtitles ? settings?.userSubtitle : MISS_USER_SUBTITLE_DEFAULT)
@@ -950,11 +950,88 @@ ${MISS_BEAUTY_CLASS_TEXT}`
             <span>${myEsc(formatMeetTime(msg.createdAt))}</span>
             ${options.resumeButton
               ? '<button type="button" class="miss-entry-resume" title="从这里重开"><i class="fa-solid fa-code-branch"></i><span>从这里重开</span></button>'
-              : `<button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
+              : `${isUser ? '' : '<button type="button" class="miss-entry-speak" title="朗读对白"><i class="fa-solid fa-volume-high"></i></button>'}<button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
             <button type="button" class="miss-entry-delete" title="删除"><i class="fa-regular fa-trash-can"></i></button>`}
           </div>
         </div>
       </article>`
+  }
+
+  // ===== 朗读角色对白（Fish / Minimax，按设置里当前语音服务） =====
+  const MISS_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  const _missSpeechCache = new Map()
+  let _missSpeechAudio = null
+  let _missSpeechBtn = null
+
+  function extractOfflineSpeech(text) {
+    const src = String(text || '').replace(/<status>[\s\S]*?<\/status>/gi, '')
+    const re = /“([^”]+)”|「([^」]+)」|『([^』]+)』|"([^"\n]+)"/g
+    const out = []
+    let m
+    while ((m = re.exec(src))) {
+      const t = (m[1] || m[2] || m[3] || m[4] || '').trim()
+      if (t) out.push(t)
+    }
+    return out.join(' ')
+  }
+
+  function stopMissSpeech() {
+    if (_missSpeechAudio) {
+      try { _missSpeechAudio.pause() } catch (_) {}
+      _missSpeechAudio = null
+    }
+    if (_missSpeechBtn) {
+      _missSpeechBtn.classList.remove('is-playing', 'is-loading')
+      _missSpeechBtn = null
+    }
+  }
+
+  async function speakOfflineEntry(page, msgId, btn) {
+    if (_missSpeechBtn === btn) { stopMissSpeech(); return }
+    stopMissSpeech()
+    // 在点击手势里先“解锁”音频，iOS 上异步生成完再播放才不会被拦
+    const audio = new Audio()
+    audio.src = MISS_SILENT_WAV
+    audio.play().catch(() => {})
+    _missSpeechAudio = audio
+    _missSpeechBtn = btn
+    btn.classList.add('is-loading')
+    try {
+      const row = await db.offlineChats.get(msgId)
+      if (!row) throw new Error('找不到这条记录')
+      const settings = page?._missState?.settings || await getOfflineSettings(row.ownerUid, row.chatId, row.mode)
+      const parsed = parseMissStatus(row.content || '', settings)
+      const text = extractOfflineSpeech(stripOfflineLabel(parsed.status ? parsed.text : row.content))
+      if (!text) { window.toast?.('这条里没有对白可以朗读'); stopMissSpeech(); return }
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.callTTS !== 'function' || typeof helpers.getChatVoiceId !== 'function') {
+        throw new Error('语音功能未加载')
+      }
+      const voiceId = await helpers.getChatVoiceId(row.chatId)
+      if (!voiceId) { window.toast?.('这个角色还没设置音色 ID（微信聊天设置里填）'); stopMissSpeech(); return }
+      const key = voiceId + '|' + text
+      let url = _missSpeechCache.get(key)
+      if (!url) {
+        url = await helpers.callTTS(text, voiceId)
+        _missSpeechCache.set(key, url)
+        if (_missSpeechCache.size > 20) {
+          const oldest = _missSpeechCache.keys().next().value
+          URL.revokeObjectURL(_missSpeechCache.get(oldest))
+          _missSpeechCache.delete(oldest)
+        }
+      }
+      if (_missSpeechBtn !== btn) return // 期间被点了停止或换了别条
+      btn.classList.remove('is-loading')
+      btn.classList.add('is-playing')
+      audio.src = url
+      audio.addEventListener('ended', () => { if (_missSpeechBtn === btn) stopMissSpeech() })
+      await audio.play()
+    } catch (e) {
+      stopMissSpeech()
+      const msg = '朗读失败：' + (e.message || e)
+      if (typeof showApiErrorModal === 'function') showApiErrorModal(msg)
+      else window.toast?.(msg)
+    }
   }
 
   function bindMissEntryActions(root, page) {
@@ -967,6 +1044,15 @@ ${MISS_BEAUTY_CLASS_TEXT}`
           return
         }
         showMissStatusCard(head, { fields })
+      })
+    })
+    root.querySelectorAll('.miss-entry-speak').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation()
+        const entry = btn.closest('.miss-entry')
+        const id = parseInt(entry?.dataset.msgId, 10)
+        if (!id) return
+        speakOfflineEntry(page, id, btn)
       })
     })
     root.querySelectorAll('.miss-entry-more').forEach(btn => {
@@ -1144,7 +1230,12 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   function formatMissQuoteHighlights(html) {
-    return String(html || '').replace(/“([^”]*)”/g, '<span class="miss-quote-highlight">“$1”</span>')
+    // 入参已经过 HTML 转义，所以直引号是 &quot;
+    return String(html || '')
+      .replace(/“([^”]*)”/g, '<span class="miss-quote-highlight">“$1”</span>')
+      .replace(/「([^」]*)」/g, '<span class="miss-quote-highlight">「$1」</span>')
+      .replace(/『([^』]*)』/g, '<span class="miss-quote-highlight">『$1』</span>')
+      .replace(/&quot;(.+?)&quot;/g, '<span class="miss-quote-highlight">&quot;$1&quot;</span>')
   }
 
   function startOfflineAIReply(page, options = {}) {
@@ -1252,6 +1343,13 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const memoryBlock = buildOfflineMemoryBlock(memoryCtx)
     const antiRepeatBlock = buildAntiRepeatBlock(offlineAll)
     const narrativeRule = buildNarrativePersonRule(settings.narrativePerson, charName, userName)
+    let ttsTagRule = ''
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.isTTSTagEnabled === 'function' && await helpers.isTTSTagEnabled()) {
+        ttsTagRule = `- 对白可以在引号内开头用【】标出语气，之后朗读会更有感情，例如：“【低声】我想你了。”。标签用中文短语（2-6 个字，如【轻声】【轻笑】【叹气】【撒娇】【害羞】【哽咽】），每句对白最多 1 个，只写在引号里，旁白和动作描写里不要写。\n`
+      }
+    } catch (_) {}
     return `# 想见你线下模式
 
 你扮演【${charName}】，正在和【${userName}】线下真实见面。你不是${userName}，也不是语言模型；你有自己的性格、情绪、边界和判断。
@@ -1293,7 +1391,9 @@ ${settings.statusFormat}
 - 只输出${charName}这一轮回应，不替${userName}说话或新增${userName}动作。
 - ${settings.minWords}-${settings.maxWords}个中文字符；每次都推进动作、情绪、话题或关系张力。
 - ${narrativeRule}
-- 必须同时包含动作描写、神态描写和心理活动；动作与对白分段换行，不要堆成一行。
+- 对白一律用中文弯引号“”包裹（不要用直引号 " 或「」）。
+- 不要输出“线下见面中，角色：”这类前缀，直接写正文。
+${ttsTagRule}- 必须同时包含动作描写、神态描写和心理活动；动作与对白分段换行，不要堆成一行。
 - 允许符合人设和关系的自然肢体互动，不能突兀升级，也不能无条件讨好${userName}。
 
 ## 禁止
@@ -2135,11 +2235,28 @@ ${summary}
     return result
   }
 
+  // 微信时间线里线下记录带有“线下见面中，角色：”前缀，模型有时会照抄；这里统一去掉
+  const MISS_OFFLINE_LABEL_RE = /线下见面中[，,]\s*(?:角色|用户)\s*[：:]\s*/g
+
+  function stripOfflineLabel(text) {
+    return String(text || '').replace(MISS_OFFLINE_LABEL_RE, '')
+  }
+
+  // 对白里的【语气】标签只给朗读用，显示时去掉（存档里保留）
+  function stripOfflineTags(text) {
+    const rm = str => str.replace(/【[^】\n]{1,30}】/g, '')
+    return String(text || '')
+      .replace(/“([^”]*)”/g, (m, inner) => '“' + rm(inner) + '”')
+      .replace(/「([^」]*)」/g, (m, inner) => '「' + rm(inner) + '」')
+      .replace(/『([^』]*)』/g, (m, inner) => '『' + rm(inner) + '』')
+      .replace(/"([^"\n]*)"/g, (m, inner) => '"' + rm(inner) + '"')
+  }
+
   function cleanOfflineReply(raw) {
-    return String(raw || '')
+    return stripOfflineLabel(String(raw || '')
       .trim()
       .replace(/^```(?:text|markdown)?\s*/i, '')
-      .replace(/```$/i, '')
+      .replace(/```$/i, ''))
       .trim()
   }
 })()

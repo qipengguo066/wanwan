@@ -7275,7 +7275,7 @@ function hasLaterOnlineEvent(events, currentIndex, afterTime) {
 
 function formatWechatOfflineMessage(row) {
   const speaker = row.role === 'assistant' ? '角色' : '用户'
-  const text = String(row.content || '').trim()
+  const text = String(row.content || '').replace(/线下见面中[，,]\s*(?:角色|用户)\s*[：:]\s*/g, '').trim()
   if (!text) return ''
   return `线下见面中，${speaker}：${text}`
 }
@@ -7858,6 +7858,8 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
     part2
 
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
+  const ttsTagHintChat = await getTTSTagHint('chat', charName)
+  if (ttsTagHintChat) system += '\n\n' + ttsTagHintChat
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
   if (idleContext?.enabled && idleContext.mode === 'auto_reply') system += '\n\n' + buildSystemAutoReplyPart(idleContext)
   const requirement = String(replyRequirement || '').trim()
@@ -18995,10 +18997,47 @@ async function callFishTTS(text, voiceId) {
   return URL.createObjectURL(new Blob([blob], { type: 'audio/mpeg' }))
 }
 
+// 角色在文字里用【中文语气】标语气；Fish 朗读前换成 [中文语气]（S2.1 的标签语法，不会被读出来），Minimax 不支持就直接去掉
+function prepareTTSText(text, provider) {
+  const s = String(text || '')
+  if (provider === 'fish') return s.replace(/【([^】\n]{1,30})】/g, '[$1]')
+  return s.replace(/【[^】\n]{0,30}】/g, '').replace(/[ \t]{2,}/g, ' ').trim()
+}
+
 // 统一入口：按当前语音服务生成语音，返回 blob 地址
 async function callTTS(text, voiceId) {
   const provider = await getTTSProvider()
-  return provider === 'fish' ? callFishTTS(text, voiceId) : callMinimaxTTS(text, voiceId)
+  const prepared = prepareTTSText(text, provider)
+  if (!prepared) throw new Error('没有可朗读的文字')
+  return provider === 'fish' ? callFishTTS(prepared, voiceId) : callMinimaxTTS(prepared, voiceId)
+}
+
+// 让角色在语音文字里写语气标签的提示词；只有当前语音服务是 Fish 时才加
+// 想改成英文标签：把下面 TTS_TAG_EXAMPLES 换成 【whispering】【laughing】【sighing】 之类，并改"2-6 个字"那句
+const TTS_TAG_EXAMPLES = '【轻声】【低声】【轻笑】【叹气】【撒娇】【害羞】【生气】【哽咽】【停顿】'
+async function isTTSTagEnabled() {
+  return (await getTTSProvider()) === 'fish'
+}
+async function getTTSTagHint(kind, charName) {
+  if (!(await isTTSTagEnabled())) return ''
+  const rules = `- 标签用中文短语，2-6 个字，可参考：${TTS_TAG_EXAMPLES}。
+- 标签放在要影响的那句话前面；每句最多 1 个，整段话总共不超过 3 个，不要连续堆叠，没有明显语气变化就不写。
+- 只用【】，不要用其他括号；标签里只写语气或情绪，不要写动作描写或长句。
+- 标签只写在原文语言的部分，译文里不要写标签。`
+  if (kind === 'chat') {
+    return `# 【语音消息的语气标签】
+发语音消息时，可以在语音文字里用【】标出语气或情绪，之后朗读会更有感情。例如：\`[${charName || '角色'}的语音：【轻声】我到家啦，【轻笑】今天好累]\`
+${rules}
+
+---`
+  }
+  if (kind === 'call') {
+    return `【语气标签】
+"speech" 里可以用【】标出语气或情绪，之后朗读会更有感情。例如：{"scene":"...","speech":"【轻笑】喂？怎么啦，【轻声】突然打电话过来"}
+${rules}
+- 标签写在 speech 字符串里即可，JSON 格式保持合法。`
+  }
+  return ''
 }
 
 // 搜索/拉取 Fish 音色。self=true 只拿自己账号下的音色
@@ -19761,6 +19800,7 @@ let _callHistory = []
 let _callSystemPrompt = ''
 let _callState = 'idle'
 let _callType = null
+let _callAutoSpeak = true // 通话里角色说话是否自动朗读（默认开，记在 db.config.callAutoSpeak）
 let _callStartTime = null
 let _callTimerInterval = null
 let _callChatId = null
@@ -19997,6 +20037,8 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'voice', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  const ttsTagHintVoice = await getTTSTagHint('call', charName)
+  if (ttsTagHintVoice) prompt += ttsTagHintVoice + '\n\n'
 
   prompt += buildCallOutputFormat('voice') + '\n'
 
@@ -20037,6 +20079,8 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'video', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  const ttsTagHintVideo = await getTTSTagHint('call', charName)
+  if (ttsTagHintVideo) prompt += ttsTagHintVideo + '\n\n'
 
   if (_realCameraActive) {
     prompt += buildRealCameraPart(charName, userName) + '\n\n'
@@ -20177,6 +20221,11 @@ async function startCall(chatId, charId, type, initiator = 'user') {
     return
   }
 
+  try {
+    const autoCfg = await db.config.get('callAutoSpeak')
+    _callAutoSpeak = autoCfg ? autoCfg.value !== false : true
+  } catch (_) { _callAutoSpeak = true }
+
   const page = document.createElement('div')
   page.id = 'call-page'
   page.className = `full-page call-page ${type === 'video' ? 'video-call-page' : 'voice-call-page'}`
@@ -20220,6 +20269,31 @@ function bindCallEvents(page, type) {
   page.addEventListener('pointerdown', retryPendingCallAudioPlayback)
   page.querySelector('#btn-call-hangup').addEventListener('click', () => endCall())
   page.querySelector('#btn-call-minimize')?.addEventListener('click', () => minimizeCall())
+
+  // 自动朗读开关（右上角）
+  const callContent = page.querySelector('.call-content')
+  if (callContent && !page.querySelector('#btn-call-autospeak')) {
+    const autoBtn = document.createElement('button')
+    autoBtn.type = 'button'
+    autoBtn.id = 'btn-call-autospeak'
+    autoBtn.className = 'call-minimize-btn call-autospeak-btn'
+    const paintAuto = () => {
+      autoBtn.innerHTML = `<i class="fa-solid ${_callAutoSpeak ? 'fa-volume-high' : 'fa-volume-xmark'}"></i>`
+      autoBtn.title = _callAutoSpeak ? '自动朗读：开' : '自动朗读：关'
+    }
+    paintAuto()
+    autoBtn.addEventListener('click', async () => {
+      _callAutoSpeak = !_callAutoSpeak
+      paintAuto()
+      try { await db.config.put({ key: 'callAutoSpeak', value: _callAutoSpeak }) } catch (_) {}
+      if (!_callAutoSpeak) {
+        cancelCallTTSRetry()
+        stopCallAudio()
+      }
+      window.toast?.(_callAutoSpeak ? '自动朗读已开启' : '自动朗读已关闭，可点气泡旁的小喇叭')
+    })
+    callContent.appendChild(autoBtn)
+  }
 
   page.querySelector('#btn-call-mute')?.addEventListener('click', function () {
     this.classList.toggle('active')
@@ -20386,7 +20460,7 @@ async function sendCallAIRequest(page) {
     updateCallScene(page, parsed.scene)
     updateCallSpeech(page, parsed.speech)
 
-    playCallTTS(parsed.speech)
+    if (_callAutoSpeak) playCallTTS(parsed.speech)
 
   } catch (e) {
     console.error('通话 AI 请求失败', e)
@@ -20450,10 +20524,14 @@ function updateCallSpeech(page, speechText) {
     div.className = 'call-msg call-msg-assistant'
     const bilingualParsed = helpers.parseBilingualText?.(speechText)
     if (bilingualParsed?.translation) {
-      div.innerHTML = `<span class="call-msg-text"><span class="call-msg-original">${helpers.wcEscHtml?.(bilingualParsed.original) || speechText}</span><span class="call-msg-translation">${helpers.wcEscHtml?.(bilingualParsed.translation) || bilingualParsed.translation}</span></span>`
+      div.innerHTML = `<span class="call-msg-text"><span class="call-msg-original">${helpers.wcEscHtml?.(bilingualParsed.original) || speechText}</span><span class="call-msg-translation">${helpers.wcEscHtml?.(bilingualParsed.translation) || bilingualParsed.translation}</span></span><button type="button" class="call-msg-speak" title="朗读"><i class="fa-solid fa-volume-high"></i></button>`
     } else {
-      div.innerHTML = `<span class="call-msg-text">${helpers.wcEscHtml?.(speechText) || speechText}</span>`
+      div.innerHTML = `<span class="call-msg-text">${helpers.wcEscHtml?.(speechText) || speechText}</span><button type="button" class="call-msg-speak" title="朗读"><i class="fa-solid fa-volume-high"></i></button>`
     }
+    div.querySelector('.call-msg-speak')?.addEventListener('click', e => {
+      e.stopPropagation()
+      playCallTTS(speechText)
+    })
     container.appendChild(div)
     const conversation = page.querySelector('#call-conversation')
     if (conversation) conversation.scrollTop = conversation.scrollHeight
@@ -21328,6 +21406,8 @@ window._wechatCallHelpers = {
   callMinimaxTTS,
   callTTS,
   getChatVoiceId,
+  getTTSTagHint,
+  isTTSTagEnabled,
   blobUrlToDataUrl,
   getTimeOfDay,
   getWechatDisplayCharacter,
