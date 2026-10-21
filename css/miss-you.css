@@ -420,6 +420,7 @@
   min-width: 0;
 }
 
+.miss-entry-speak,
 .miss-entry-more,
 .miss-entry-delete {
   width: 30px;
@@ -947,3 +948,8 @@ html.has-android-bottom-inset .miss-compose {
   0%, 80%, 100% { transform: translateY(0); opacity: 0.35; }
   40% { transform: translateY(-3px); opacity: 1; }
 }
+
+/* 朗读对白按钮 */
+.miss-entry-speak.is-loading { opacity: 0.5; animation: missSpeakPulse 1s infinite ease-in-out; }
+.miss-entry-speak.is-playing { color: var(--c-accent); }
+@keyframes missSpeakPulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 0.25; } }

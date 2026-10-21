@@ -6741,3 +6741,13 @@ html.has-android-bottom-inset .chat-input-bar {
 .cs-fish-meta { font-size: 11px; color: var(--c-hint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cs-fish-empty { font-size: 12px; color: var(--c-hint); padding: 10px 2px; word-break: break-all; }
 .cs-fish-more { align-self: center; }
+
+/* ===== 通话：自动朗读开关 & 气泡小喇叭 ===== */
+.call-autospeak-btn { left: auto; right: 16px; }
+.call-msg-speak {
+  flex-shrink: 0; align-self: center; width: 26px; height: 26px; border-radius: 50%;
+  border: none; background: rgba(0, 0, 0, 0.06); color: #666; font-size: 12px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.call-msg-speak:active { background: rgba(0, 0, 0, 0.14); }
