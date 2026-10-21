@@ -70,6 +70,12 @@ function buildApiSection() {
       '<span class="row-value" id="val-minimax-config">未配置</span>' +
       '<i class="fa fa-angle-right row-chevron"></i>' +
     '</div>' +
+    '<div class="list-row clickable" id="row-fish-config">' +
+      '<div class="row-icon-box"><i class="fa-solid fa-fish"></i></div>' +
+      '<div class="row-body"><div class="row-label">Fish Audio 语音配置</div></div>' +
+      '<span class="row-value" id="val-fish-config">未配置</span>' +
+      '<i class="fa fa-angle-right row-chevron"></i>' +
+    '</div>' +
     '<div class="list-row clickable" id="row-image-gen-config">' +
       '<div class="row-icon-box"><i class="fa-solid fa-image"></i></div>' +
       '<div class="row-body"><div class="row-label">IMAGE 图像配置</div></div>' +
@@ -92,6 +98,11 @@ function openMinimaxConfigPage() {
   }).join('')
   var html =
     '<div class="setting-section"><div class="api-form" id="minimax-form">' +
+      '<label class="form-label">当前使用的语音服务</label>' +
+      '<select class="input-field" id="tts-provider-select">' +
+        '<option value="minimax">Minimax</option>' +
+        '<option value="fish">Fish Audio</option>' +
+      '</select>' +
       '<label class="form-label">API 版本</label>' +
       '<select class="input-field" id="minimax-version">' +
         '<option value="domestic">官方版（api.minimax.chat）</option>' +
@@ -125,8 +136,11 @@ async function initMinimaxConfigPage(page) {
     db.config.get('minimaxVersion'),
     db.config.get('minimaxGroupId'),
     db.config.get('minimaxApiKey'),
-    db.config.get('minimaxModel')
+    db.config.get('minimaxModel'),
+    db.config.get('ttsProvider')
   ])
+  var providerEl = page.querySelector('#tts-provider-select')
+  if (providerEl) providerEl.value = (results[4] && results[4].value === 'fish') ? 'fish' : 'minimax'
   var versionEl = page.querySelector('#minimax-version')
   var groupIdEl = page.querySelector('#minimax-group-id')
   var apiKeyEl = page.querySelector('#minimax-api-key')
@@ -149,13 +163,121 @@ async function initMinimaxConfigPage(page) {
         db.config.put({ key: 'minimaxVersion', value: versionEl.value }),
         db.config.put({ key: 'minimaxGroupId', value: groupIdEl.value.trim() }),
         db.config.put({ key: 'minimaxApiKey', value: apiKeyEl.value.trim() }),
-        db.config.put({ key: 'minimaxModel', value: modelEl.value })
+        db.config.put({ key: 'minimaxModel', value: modelEl.value }),
+        db.config.put({ key: 'ttsProvider', value: providerEl ? providerEl.value : 'minimax' })
       ])
       var settingsPage = document.getElementById('settings-page')
       if (settingsPage) await updateRowValues(settingsPage)
       window.toast('Minimax 语音配置已保存')
     } catch (error) {
       window.toast('Minimax 语音配置保存失败：' + (error.message || error))
+    }
+  })
+}
+
+// ===== Fish Audio 语音配置 =====
+var FISH_DEFAULT_BASE = 'https://api.fish.audio'
+var FISH_MODELS = [
+  { value: 's2.1-pro-free', label: 's2.1-pro-free（免费体验）' },
+  { value: 's2.1-pro', label: 's2.1-pro' },
+  { value: 's2-pro', label: 's2-pro' }
+]
+
+function openFishConfigPage() {
+  var modelOptions = FISH_MODELS.map(function(m) {
+    return '<option value="' + m.value + '">' + m.label + '</option>'
+  }).join('')
+  var html =
+    '<div class="setting-section"><div class="api-form" id="fish-form">' +
+      '<label class="form-label">当前使用的语音服务</label>' +
+      '<select class="input-field" id="tts-provider-select">' +
+        '<option value="minimax">Minimax</option>' +
+        '<option value="fish">Fish Audio</option>' +
+      '</select>' +
+      '<label class="form-label">站点（API 地址）</label>' +
+      '<input class="input-field" id="fish-base-url" placeholder="' + FISH_DEFAULT_BASE + '">' +
+      '<label class="form-label">API Key</label>' +
+      '<div class="input-with-toggle">' +
+        '<input class="input-field" id="fish-api-key" type="text" placeholder="输入 Fish Audio API Key">' +
+        '<button class="btn-text-toggle" id="toggle-fish-key-vis">隐藏</button>' +
+      '</div>' +
+      '<label class="form-label">语音模型</label>' +
+      '<select class="input-field" id="fish-model">' +
+        '<option value="">选择模型...</option>' +
+        modelOptions +
+      '</select>' +
+      '<div class="section-desc" style="padding:8px 0 0">' +
+        '站点默认是官方地址 ' + FISH_DEFAULT_BASE + '，如果以后自己搭了转发地址可以改这里。<br>' +
+        '音色 ID 在「聊天设置 → 语音克隆」里按角色设置，可以直接搜索音色。<br>' +
+        '访问 Fish 需要开 VPN。' +
+      '</div>' +
+      '<button class="btn-pill btn-full" id="btn-save-fish">保存</button>' +
+      '<button class="btn-pill btn-full" id="btn-test-fish" style="margin-top:10px">测试连接（查询余额）</button>' +
+    '</div></div>'
+  var page = buildSubPage('sub-fish-config', 'Fish Audio 语音配置', html)
+  openSubPage(page)
+  initFishConfigPage(page)
+}
+
+async function initFishConfigPage(page) {
+  var results = await Promise.all([
+    db.config.get('fishBaseUrl'),
+    db.config.get('fishApiKey'),
+    db.config.get('fishModel'),
+    db.config.get('ttsProvider')
+  ])
+  var providerEl = page.querySelector('#tts-provider-select')
+  var baseEl = page.querySelector('#fish-base-url')
+  var apiKeyEl = page.querySelector('#fish-api-key')
+  var modelEl = page.querySelector('#fish-model')
+  if (providerEl) providerEl.value = (results[3] && results[3].value === 'fish') ? 'fish' : 'minimax'
+  if (baseEl) baseEl.value = (results[0] && results[0].value) || FISH_DEFAULT_BASE
+  if (apiKeyEl && results[1]) apiKeyEl.value = results[1].value || ''
+  if (modelEl && results[2]) modelEl.value = results[2].value || ''
+  bindKeyVisibilityText(page, 'toggle-fish-key-vis', 'fish-api-key')
+
+  page.querySelector('#btn-save-fish').addEventListener('click', async function() {
+    var missing = findMissingSettingsFields([
+      { el: baseEl, label: '站点' },
+      { el: apiKeyEl, label: 'API Key' },
+      { el: modelEl, label: '语音模型' }
+    ])
+    if (showIncompleteSettingsSave(missing, 'Fish Audio 语音配置')) return
+    try {
+      await Promise.all([
+        db.config.put({ key: 'fishBaseUrl', value: baseEl.value.trim().replace(/\/+$/, '') }),
+        db.config.put({ key: 'fishApiKey', value: apiKeyEl.value.trim() }),
+        db.config.put({ key: 'fishModel', value: modelEl.value }),
+        db.config.put({ key: 'ttsProvider', value: providerEl ? providerEl.value : 'minimax' })
+      ])
+      var settingsPage = document.getElementById('settings-page')
+      if (settingsPage) await updateRowValues(settingsPage)
+      window.toast('Fish Audio 语音配置已保存')
+    } catch (error) {
+      window.toast('Fish Audio 语音配置保存失败：' + (error.message || error))
+    }
+  })
+
+  // 测试连接：只查询余额，不会生成语音
+  page.querySelector('#btn-test-fish').addEventListener('click', async function() {
+    var base = (baseEl.value.trim() || FISH_DEFAULT_BASE).replace(/\/+$/, '')
+    var key = apiKeyEl.value.trim()
+    if (!key) { window.toast('请先填写 API Key'); return }
+    window.toast('正在测试连接…')
+    try {
+      var res = await fetch(base + '/wallet/self/api-credit', {
+        headers: { 'Authorization': 'Bearer ' + key }
+      })
+      if (!res.ok) {
+        var detail = ''
+        try { var j = await res.json(); detail = j.message || '' } catch (_) {}
+        window.toast('连接失败 HTTP ' + res.status + (detail ? '：' + detail : ''))
+        return
+      }
+      var data = await res.json()
+      window.toast('连接成功，余额：' + (data.credit != null ? data.credit : '未知'))
+    } catch (error) {
+      window.toast('网络请求失败：可能没开 VPN，或浏览器被跨域（CORS）拦截')
     }
   })
 }
@@ -3725,6 +3847,7 @@ async function loadSettingsValues(page) {
   page.querySelector('#row-notification').addEventListener('click', openNotificationPage)
   page.querySelector('#row-api-config').addEventListener('click', openApiConfigPage)
   page.querySelector('#row-minimax-config').addEventListener('click', openMinimaxConfigPage)
+  page.querySelector('#row-fish-config').addEventListener('click', openFishConfigPage)
   page.querySelector('#row-image-gen-config').addEventListener('click', openImageGenConfigPage)
   page.querySelector('#row-font').addEventListener('click', openFontPage)
   page.querySelector('#row-wallpaper').addEventListener('click', openWallpaperPage)
@@ -3745,10 +3868,21 @@ async function updateRowValues(page) {
   if (valOnline) {
     valOnline.textContent = (onlineServer && onlineServer.value) ? '已配置' : '未配置'
   }
+  var ttsProviderCfg = await db.config.get('ttsProvider')
+  var ttsActive = (ttsProviderCfg && ttsProviderCfg.value === 'fish') ? 'fish' : 'minimax'
   var minimaxModel = await db.config.get('minimaxModel')
   var valMinimax = page.querySelector('#val-minimax-config')
   if (valMinimax) {
-    valMinimax.textContent = (minimaxModel && minimaxModel.value) ? minimaxModel.value : '未配置'
+    valMinimax.textContent = (minimaxModel && minimaxModel.value)
+      ? minimaxModel.value + (ttsActive === 'minimax' ? ' · 使用中' : '')
+      : '未配置'
+  }
+  var fishModelCfg = await db.config.get('fishModel')
+  var valFish = page.querySelector('#val-fish-config')
+  if (valFish) {
+    valFish.textContent = (fishModelCfg && fishModelCfg.value)
+      ? fishModelCfg.value + (ttsActive === 'fish' ? ' · 使用中' : '')
+      : '未配置'
   }
   var imageGenModel = await db.config.get('imageGenModel')
   var valImageGen = page.querySelector('#val-image-gen-config')
