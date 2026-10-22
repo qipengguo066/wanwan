@@ -1397,7 +1397,14 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     // 续写只依据当前这次线下见面的记录；微信聊天/通话/往次见面只作为“背景”放进系统提示，不作为对话上下文
     const { liveHistory, backgroundText } = splitOfflineContext(timelineContext, offlineAll, char, user)
     const system = await buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings, backgroundText)
-    const timeline = buildOfflineTimeline(liveHistory, { isContinuation })
+    let tagReminder = ''
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.isTTSTagEnabled === 'function' && await helpers.isTTSTagEnabled()) {
+        tagReminder = '（提醒：这一条回复里每一句对白的引号内开头都要带一个【语气】标签，例如“【轻声】……”。）'
+      }
+    } catch (_) {}
+    const timeline = buildOfflineTimeline(liveHistory, { isContinuation, tagReminder })
     const raw = await window.callAI(timeline, { system, temperature: await window.getAITemperaturePreset('offlineMode') })
     const reply = cleanOfflineReply(raw)
     if (!reply) throw new Error('AI 返回了空响应，请检查 API 配置或稍后重试')
@@ -1465,7 +1472,9 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     try {
       const helpers = window._wechatCallHelpers || {}
       if (typeof helpers.isTTSTagEnabled === 'function' && await helpers.isTTSTagEnabled()) {
-        ttsTagRule = `- 对白可以在引号内开头用【】标出语气，之后朗读会更有感情，例如：“【低声】我想你了。”。标签用中文短语（2-6 个字，如【轻声】【轻笑】【叹气】【撒娇】【害羞】【哽咽】），每句对白最多 1 个，只写在引号里，旁白和动作描写里不要写。\n`
+        ttsTagRule = `- 【语气标签（必须遵守）】这条回复里的每一句对白，引号内的开头都必须带 1 个【】语气标签，用于之后朗读，不能省略。标签用中文短语（2-6 个字，按当下情绪具体选，如【轻声】【低声】【轻笑】【叹气】【撒娇】【害羞】【哽咽】【犹豫】【温柔】【打趣】）。标签只写在引号里，旁白、动作和心理描写里不要写。即使前面的见面记录里没有标签，从这一条开始也必须写。
+  正确示例：他低下头，声音很轻。“【低声】我想你了。”过了一会儿又笑起来：“【轻笑】你怎么还是这样。”
+  错误示例（缺少标签）：“我想你了。”\n`
       }
     } catch (_) {}
     return `# 想见你线下模式
@@ -2357,6 +2366,9 @@ ${summary}
         role: 'user',
         content: '（续写：请在不新增用户发言的前提下，承接你上一条角色回复继续推进当前线下剧情。不要复述或改写刚发生的动作、台词、情绪或场景，必须引入新的动作、反应、话题或情绪变化，并继续严格遵守系统提示中的状态栏格式、字数、人设和禁忌。）'
       })
+    }
+    if (options.tagReminder) {
+      result.push({ role: 'user', content: options.tagReminder })
     }
     return result
   }
