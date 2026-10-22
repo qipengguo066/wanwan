@@ -949,7 +949,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
           <div class="miss-entry-footer">
             <span>${myEsc(formatMeetTime(msg.createdAt))}</span>
             ${options.resumeButton
-              ? '<button type="button" class="miss-entry-resume" title="从这里重开"><i class="fa-solid fa-code-branch"></i><span>从这里重开</span></button>'
+              ? (isUser ? '' : '<button type="button" class="miss-entry-speak" title="朗读对白"><i class="fa-solid fa-volume-high"></i></button>') + '<button type="button" class="miss-entry-resume" title="从这里重开"><i class="fa-solid fa-code-branch"></i><span>从这里重开</span></button>'
               : `${isUser ? '' : '<button type="button" class="miss-entry-speak" title="朗读对白"><i class="fa-solid fa-volume-high"></i></button>'}<button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
             <button type="button" class="miss-entry-delete" title="删除"><i class="fa-regular fa-trash-can"></i></button>`}
           </div>
@@ -1343,6 +1343,12 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const memoryBlock = buildOfflineMemoryBlock(memoryCtx)
     const antiRepeatBlock = buildAntiRepeatBlock(offlineAll)
     const narrativeRule = buildNarrativePersonRule(settings.narrativePerson, charName, userName)
+    let scheduleRule = ''
+    try {
+      const helpers0 = window._wechatCallHelpers || {}
+      const sched = typeof helpers0.getScheduleContext === 'function' ? await helpers0.getScheduleContext() : ''
+      if (sched) scheduleRule = '\n' + sched + '\n'
+    } catch (_) {}
     let ttsTagRule = ''
     try {
       const helpers = window._wechatCallHelpers || {}
@@ -1393,7 +1399,7 @@ ${settings.statusFormat}
 - ${narrativeRule}
 - 对白一律用中文弯引号“”包裹（不要用直引号 " 或「」）。
 - 不要输出“线下见面中，角色：”这类前缀，直接写正文。
-${ttsTagRule}- 必须同时包含动作描写、神态描写和心理活动；动作与对白分段换行，不要堆成一行。
+${ttsTagRule}${scheduleRule}- 必须同时包含动作描写、神态描写和心理活动；动作与对白分段换行，不要堆成一行。
 - 允许符合人设和关系的自然肢体互动，不能突兀升级，也不能无条件讨好${userName}。
 
 ## 禁止
@@ -2051,6 +2057,13 @@ ${memoryCtx}`
         console.error('[miss-you] 删除见面记录失败:', error)
         window.toast('删除失败：' + (error?.message || String(error)))
       }
+    })
+    page.querySelectorAll('.miss-entry-speak').forEach(btn => {
+      btn.addEventListener('click', event => {
+        event.stopPropagation()
+        const id = parseInt(btn.closest('.miss-entry')?.dataset.msgId, 10)
+        if (id) speakOfflineEntry(page, id, btn)
+      })
     })
     page.querySelectorAll('.miss-entry-resume').forEach(btn => {
       btn.addEventListener('click', async event => {

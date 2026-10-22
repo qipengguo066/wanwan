@@ -7860,6 +7860,8 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
   const ttsTagHintChat = await getTTSTagHint('chat', charName)
   if (ttsTagHintChat) system += '\n\n' + ttsTagHintChat
+  const scheduleCtxChat = await getScheduleContext()
+  if (scheduleCtxChat) system += '\n\n' + scheduleCtxChat
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
   if (idleContext?.enabled && idleContext.mode === 'auto_reply') system += '\n\n' + buildSystemAutoReplyPart(idleContext)
   const requirement = String(replyRequirement || '').trim()
@@ -18977,6 +18979,7 @@ async function callFishTTS(text, voiceId) {
   if (!cfg.model) throw new Error('Fish Audio 语音模型未选择，请在设置中选择模型')
   if (!voiceId) throw new Error('Fish 音色 ID 未配置，请在聊天设置中填写')
 
+  console.info('[Fish TTS] 发送文字：', text)
   const res = await fishRequest(cfg, '/v1/tts', {
     method: 'POST',
     headers: {
@@ -19014,13 +19017,66 @@ async function callTTS(text, voiceId) {
 
 // 让角色在语音文字里写语气标签的提示词；只有当前语音服务是 Fish 时才加
 // 想改成英文标签：把下面 TTS_TAG_EXAMPLES 换成 【whispering】【laughing】【sighing】 之类，并改"2-6 个字"那句
+const TTS_TAG_EMOTION_HINTS = '开心：【带着笑意，语调上扬】；温柔：【轻柔缓慢，气息贴近】；难过：【气声，拖着尾音】；哽咽：【声音发颤，带着鼻音】；生气：【压低声音，克制地】；烦躁：【短促，不耐烦地叹气】；惊讶：【吸气，惊讶地】；紧张：【急促，声音发颤】；害羞：【小声，有点结巴】'
 const TTS_TAG_EXAMPLES = '【轻声】【低声】【轻笑】【叹气】【撒娇】【害羞】【生气】【哽咽】【停顿】'
+// 课表上下文（来自设置里导入的 ICS，只放今天，18:00 后加明天）
+async function getScheduleContext() {
+  try {
+    if (window.ScheduleCtx && typeof window.ScheduleCtx.build === 'function') return await window.ScheduleCtx.build()
+  } catch (_) {}
+  return ''
+}
+
+// 通用：点按钮读一段文字（通话记录用）。同一段文字同一音色在本次打开期间只生成一次
+const _speakOnceCache = new Map()
+let _speakOnceAudio = null
+let _speakOnceBtn = null
+function stopSpeakOnce() {
+  if (_speakOnceAudio) { try { _speakOnceAudio.pause() } catch (_) {} _speakOnceAudio = null }
+  if (_speakOnceBtn) { _speakOnceBtn.classList.remove('is-playing', 'is-loading'); _speakOnceBtn = null }
+}
+async function speakTextOnce(chatId, text, btn) {
+  if (_speakOnceBtn === btn) { stopSpeakOnce(); return }
+  stopSpeakOnce()
+  const audio = new Audio()
+  audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  audio.play().catch(() => {})
+  _speakOnceAudio = audio
+  _speakOnceBtn = btn
+  btn.classList.add('is-loading')
+  try {
+    const voiceId = await getChatVoiceId(chatId)
+    if (!voiceId) { window.toast?.('这个角色还没设置音色 ID（聊天设置里填）'); stopSpeakOnce(); return }
+    const key = voiceId + '|' + text
+    let url = _speakOnceCache.get(key)
+    if (!url) {
+      url = await callTTS(text, voiceId)
+      _speakOnceCache.set(key, url)
+      if (_speakOnceCache.size > 20) {
+        const oldest = _speakOnceCache.keys().next().value
+        URL.revokeObjectURL(_speakOnceCache.get(oldest))
+        _speakOnceCache.delete(oldest)
+      }
+    }
+    if (_speakOnceBtn !== btn) return
+    btn.classList.remove('is-loading')
+    btn.classList.add('is-playing')
+    audio.src = url
+    audio.addEventListener('ended', () => { if (_speakOnceBtn === btn) stopSpeakOnce() })
+    await audio.play()
+  } catch (e) {
+    stopSpeakOnce()
+    window.toast?.('朗读失败：' + (e.message || e))
+  }
+}
+
 async function isTTSTagEnabled() {
   return (await getTTSProvider()) === 'fish'
 }
 async function getTTSTagHint(kind, charName) {
   if (!(await isTTSTagEnabled())) return ''
-  const rules = `- 标签用中文短语，2-6 个字，可参考：${TTS_TAG_EXAMPLES}。
+  const rules = `- 标签用中文短语，2-10 个字，可参考：${TTS_TAG_EXAMPLES}。
+- 想要听得出区别，就写得具体一点，按当时的情绪选：${TTS_TAG_EMOTION_HINTS}。
 - 标签放在要影响的那句话前面；每句最多 1 个，整段话总共不超过 3 个，不要连续堆叠，没有明显语气变化就不写。
 - 只用【】，不要用其他括号；标签里只写语气或情绪，不要写动作描写或长句。
 - 标签只写在原文语言的部分，译文里不要写标签。`
@@ -20039,6 +20095,8 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
   if (bilingualPart) prompt += bilingualPart + '\n\n'
   const ttsTagHintVoice = await getTTSTagHint('call', charName)
   if (ttsTagHintVoice) prompt += ttsTagHintVoice + '\n\n'
+  const scheduleCtxVoice = await getScheduleContext()
+  if (scheduleCtxVoice) prompt += scheduleCtxVoice + '\n\n'
 
   prompt += buildCallOutputFormat('voice') + '\n'
 
@@ -20081,6 +20139,8 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
   if (bilingualPart) prompt += bilingualPart + '\n\n'
   const ttsTagHintVideo = await getTTSTagHint('call', charName)
   if (ttsTagHintVideo) prompt += ttsTagHintVideo + '\n\n'
+  const scheduleCtxVideo = await getScheduleContext()
+  if (scheduleCtxVideo) prompt += scheduleCtxVideo + '\n\n'
 
   if (_realCameraActive) {
     prompt += buildRealCameraPart(charName, userName) + '\n\n'
@@ -20343,6 +20403,9 @@ function handleCallUserSend(page) {
   _callHistory.push({ role: 'user', content: text })
 
   appendCallUserBubble(page, text)
+
+  // 发送后自动请求角色回复（魔法棒按钮保留，用于失败后重试）
+  if (!_callAISending) sendCallAIRequest(page)
 }
 
 async function handleCallReply(page) {
@@ -21099,6 +21162,7 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
   const user = ownerUid ? await db.characters.get(ownerUid) : null
   const userName = getCallUserBaseName(user)
   let messagesHTML = ''
+  const callSpeechList = []
   for (const m of (record.messages || [])) {
     if (m.role === 'user') {
       const content = m.content || ''
@@ -21123,7 +21187,8 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
         const speechHTML = bilingualParsed.translation
           ? `<span class="call-detail-original">${callEscHtml(bilingualParsed.original)}</span><span class="call-detail-translation">${callEscHtml(bilingualParsed.translation)}</span>`
           : callEscHtml(speech)
-        messagesHTML += `<div class="call-detail-msg call-detail-assistant"><span class="call-detail-sender">${callEscHtml(charName || '角色')}</span><span class="call-detail-text">${speechHTML}</span></div>`
+        callSpeechList.push(bilingualParsed.original || speech)
+        messagesHTML += `<div class="call-detail-msg call-detail-assistant"><span class="call-detail-sender">${callEscHtml(charName || '角色')}</span><span class="call-detail-text">${speechHTML}</span><button type="button" class="call-detail-speak" data-idx="${callSpeechList.length - 1}" title="朗读"><i class="fa-solid fa-volume-high"></i></button></div>`
       }
     }
   }
@@ -21144,7 +21209,14 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
 
   window.openPage(page)
   page.querySelector('#btn-call-detail-back').addEventListener('click', () => {
+    stopSpeakOnce()
     window.closePage('call-record-detail-page')
+  })
+  page.querySelectorAll('.call-detail-speak').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const text = callSpeechList[parseInt(btn.dataset.idx, 10)]
+      if (text) speakTextOnce(record.chatId, text, btn)
+    })
   })
 }
 
@@ -21408,6 +21480,8 @@ window._wechatCallHelpers = {
   getChatVoiceId,
   getTTSTagHint,
   isTTSTagEnabled,
+  getScheduleContext,
+  speakTextOnce,
   blobUrlToDataUrl,
   getTimeOfDay,
   getWechatDisplayCharacter,
