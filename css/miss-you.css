@@ -599,7 +599,8 @@ html.has-android-bottom-inset .miss-compose {
   animation-delay: 0.3s;
 }
 
-.miss-settings-btn {
+.miss-settings-btn,
+.miss-autospeak-btn {
   flex: 0 0 auto;
 }
 
