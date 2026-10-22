@@ -432,6 +432,11 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   window.showMissYouPage = async function() {
+    try {
+      const autoCfg = await db.config.get('missAutoSpeak')
+      _missAutoSpeak = autoCfg ? autoCfg.value !== false : true
+    } catch (_) { _missAutoSpeak = true }
+    _missNoVoiceToasted = false
     const page = document.createElement('div')
     page.id = 'miss-you-page'
     page.className = 'full-page miss-page'
@@ -439,6 +444,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       <div class="page-header miss-header">
         <button class="header-back" id="miss-back"><i class="fa fa-angle-left"></i></button>
         <span class="header-title" id="miss-title">想见你</span>
+        <button class="btn-icon miss-autospeak-btn" id="miss-autospeak" type="button" style="display:none"></button>
         <button class="btn-icon miss-settings-btn" id="miss-settings" title="见面设置" style="display:none">
           <i class="fa-solid fa-ellipsis-vertical"></i>
         </button>
@@ -451,6 +457,24 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       const state = page._missState || {}
       if (state.view === 'chat') openMissSettingsPage(page, state.ownerUid, state.chat, state.mode)
     })
+    // 自动朗读开关（右上角）：默认开，点一下关，再点开
+    const autoBtn = page.querySelector('#miss-autospeak')
+    const paintAuto = () => {
+      autoBtn.innerHTML = `<i class="fa-solid ${_missAutoSpeak ? 'fa-volume-high' : 'fa-volume-xmark'}"></i>`
+      autoBtn.title = _missAutoSpeak ? '自动朗读：开' : '自动朗读：关'
+      autoBtn.setAttribute('aria-label', autoBtn.title)
+    }
+    paintAuto()
+    autoBtn.addEventListener('click', async () => {
+      _missAutoSpeak = !_missAutoSpeak
+      paintAuto()
+      try { await db.config.put({ key: 'missAutoSpeak', value: _missAutoSpeak }) } catch (_) {}
+      if (!_missAutoSpeak) stopMissSpeech()
+      window.toast?.(_missAutoSpeak ? '自动朗读已开启' : '自动朗读已关闭，可点每条记录底部的小喇叭')
+    })
+    // iOS 需要在用户点击/触摸里“解锁”一次音频，之后自动朗读才不会被拦
+    page.addEventListener('click', unlockMissAudio, true)
+    page.addEventListener('touchend', unlockMissAudio, true)
     window.openPage(page)
     await renderAccountPicker(page)
   }
@@ -466,6 +490,8 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     if (!btn) return
     const state = page._missState || {}
     btn.style.display = state.view === 'chat' ? 'flex' : 'none'
+    const autoBtn = page.querySelector('#miss-autospeak')
+    if (autoBtn) autoBtn.style.display = state.view === 'chat' ? 'flex' : 'none'
   }
 
   async function handleMissBack(page) {
@@ -962,6 +988,25 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   const _missSpeechCache = new Map()
   let _missSpeechAudio = null
   let _missSpeechBtn = null
+  let _missAutoSpeak = true // 角色回复后是否自动朗读（默认开，记在 db.config.missAutoSpeak）
+  let _missNoVoiceToasted = false
+  let _missSharedAudio = null // 全程复用同一个 Audio 元素，iOS 上解锁一次后自动播放才不会被拦
+
+  function getMissAudio() {
+    if (!_missSharedAudio) _missSharedAudio = new Audio()
+    return _missSharedAudio
+  }
+
+  function unlockMissAudio() {
+    const a = getMissAudio()
+    if (a._missUnlocked) return
+    a._missUnlocked = true
+    try {
+      a.src = MISS_SILENT_WAV
+      const p = a.play()
+      if (p && p.catch) p.catch(() => { a._missUnlocked = false })
+    } catch (_) { a._missUnlocked = false }
+  }
 
   function extractOfflineSpeech(text) {
     const src = String(text || '').replace(/<status>[\s\S]*?<\/status>/gi, '')
@@ -978,6 +1023,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   function stopMissSpeech() {
     if (_missSpeechAudio) {
       try { _missSpeechAudio.pause() } catch (_) {}
+      _missSpeechAudio.onended = null
       _missSpeechAudio = null
     }
     if (_missSpeechBtn) {
@@ -986,13 +1032,16 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     }
   }
 
-  async function speakOfflineEntry(page, msgId, btn) {
+  async function speakOfflineEntry(page, msgId, btn, opts = {}) {
+    const auto = !!opts.auto
     if (_missSpeechBtn === btn) { stopMissSpeech(); return }
     stopMissSpeech()
-    // 在点击手势里先“解锁”音频，iOS 上异步生成完再播放才不会被拦
-    const audio = new Audio()
-    audio.src = MISS_SILENT_WAV
-    audio.play().catch(() => {})
+    const audio = getMissAudio()
+    if (!auto) {
+      // 手动点击：在手势里先“解锁”音频，iOS 上异步生成完再播放才不会被拦
+      audio.src = MISS_SILENT_WAV
+      audio.play().catch(() => {})
+    }
     _missSpeechAudio = audio
     _missSpeechBtn = btn
     btn.classList.add('is-loading')
@@ -1002,13 +1051,18 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       const settings = page?._missState?.settings || await getOfflineSettings(row.ownerUid, row.chatId, row.mode)
       const parsed = parseMissStatus(row.content || '', settings)
       const text = extractOfflineSpeech(stripOfflineLabel(parsed.status ? parsed.text : row.content))
-      if (!text) { window.toast?.('这条里没有对白可以朗读'); stopMissSpeech(); return }
+      if (!text) { if (!auto) window.toast?.('这条里没有对白可以朗读'); stopMissSpeech(); return }
       const helpers = window._wechatCallHelpers || {}
       if (typeof helpers.callTTS !== 'function' || typeof helpers.getChatVoiceId !== 'function') {
         throw new Error('语音功能未加载')
       }
       const voiceId = await helpers.getChatVoiceId(row.chatId)
-      if (!voiceId) { window.toast?.('这个角色还没设置音色 ID（微信聊天设置里填）'); stopMissSpeech(); return }
+      if (!voiceId) {
+        if (!auto || !_missNoVoiceToasted) window.toast?.('这个角色还没设置音色 ID（微信聊天设置里填）')
+        if (auto) _missNoVoiceToasted = true
+        stopMissSpeech()
+        return
+      }
       const key = voiceId + '|' + text
       let url = _missSpeechCache.get(key)
       if (!url) {
@@ -1024,10 +1078,18 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       btn.classList.remove('is-loading')
       btn.classList.add('is-playing')
       audio.src = url
-      audio.addEventListener('ended', () => { if (_missSpeechBtn === btn) stopMissSpeech() })
+      audio.onended = () => { if (_missSpeechBtn === btn) stopMissSpeech() }
       await audio.play()
     } catch (e) {
       stopMissSpeech()
+      if (auto) {
+        // 自动朗读失败不弹大窗，提示一下即可，可以点小喇叭重试
+        console.warn('[miss-you] 自动朗读失败:', e)
+        window.toast?.(e && e.name === 'NotAllowedError'
+          ? '浏览器拦截了自动播放，请点小喇叭手动听'
+          : '自动朗读失败，可点小喇叭重试')
+        return
+      }
       const msg = '朗读失败：' + (e.message || e)
       if (typeof showApiErrorModal === 'function') showApiErrorModal(msg)
       else window.toast?.(msg)
@@ -1244,12 +1306,14 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const key = pendingKey(state.ownerUid, state.chat.id, state.mode)
     if (_missYouPending.has(key)) return
     _missYouPending.add(key)
+    stopMissSpeech() // 用户已经继续往下聊，先停掉上一条的朗读
     applyMissPending(page, true)
     ;(async () => {
       try {
         const reply = await generateOfflineReply(state.ownerUid, state.chat, state.mode, options)
-        await addOfflineMessage(state.ownerUid, state.chat.id, state.chat.charId, state.mode, 'assistant', reply)
+        const newId = await addOfflineMessage(state.ownerUid, state.chat.id, state.chat.charId, state.mode, 'assistant', reply)
         await refreshOfflineChat(page)
+        if (_missAutoSpeak) autoSpeakOfflineReply(page, newId, state)
       } catch (e) {
         if (typeof showApiErrorModal === 'function') showApiErrorModal(e.message || String(e))
         else window.toast('AI 回复失败：' + (e.message || String(e)))
@@ -1258,6 +1322,16 @@ ${MISS_BEAUTY_CLASS_TEXT}`
         applyMissPending(page, false)
       }
     })()
+  }
+
+  function autoSpeakOfflineReply(page, msgId, state) {
+    if (!msgId || !document.body.contains(page)) return
+    const cur = page._missState
+    // 用户中途退出或换了聊天对象就不读了
+    if (!cur || cur.view !== 'chat' || cur.chat.id !== state.chat.id || cur.mode !== state.mode) return
+    const btn = page.querySelector(`.miss-entry[data-msg-id="${msgId}"] .miss-entry-speak`)
+    if (!btn) return
+    speakOfflineEntry(page, msgId, btn, { auto: true })
   }
 
   function applyMissPending(page, isPending) {
