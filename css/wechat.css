@@ -6751,3 +6751,20 @@ html.has-android-bottom-inset .chat-input-bar {
   -webkit-tap-highlight-color: transparent;
 }
 .call-msg-speak:active { background: rgba(0, 0, 0, 0.14); }
+
+/* ===== 通话记录详情：朗读按钮 ===== */
+.call-detail-speak {
+  align-self: flex-start; margin-top: 4px; width: 28px; height: 28px; border-radius: 50%;
+  border: none; background: rgba(0, 0, 0, 0.06); color: #666; font-size: 12px;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.call-detail-speak.is-loading { opacity: 0.5; }
+.call-detail-speak.is-playing { color: var(--c-accent); }
+.call-detail-assistant { align-items: flex-start; }
+
+/* ===== iOS：输入框保持可选中文字，避免中文拼音候选条异常（如果无效可整段删除） ===== */
+input, textarea, [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+}
