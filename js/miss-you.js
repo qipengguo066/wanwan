@@ -1394,15 +1394,53 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       : ''
     const lastOffline = offlineAll[offlineAll.length - 1]
     const isContinuation = !!(options.preferContinue && lastOffline && lastOffline.role !== 'user')
-    const system = await buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings)
-    const timeline = buildOfflineTimeline(timelineContext.textHistory || [], { isContinuation })
+    // 续写只依据当前这次线下见面的记录；微信聊天/通话/往次见面只作为“背景”放进系统提示，不作为对话上下文
+    const { liveHistory, backgroundText } = splitOfflineContext(timelineContext, offlineAll, char, user)
+    const system = await buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings, backgroundText)
+    const timeline = buildOfflineTimeline(liveHistory, { isContinuation })
     const raw = await window.callAI(timeline, { system, temperature: await window.getAITemperaturePreset('offlineMode') })
     const reply = cleanOfflineReply(raw)
     if (!reply) throw new Error('AI 返回了空响应，请检查 API 配置或稍后重试')
     return reply
   }
 
-  async function buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings) {
+  // 把统一时间线拆成两部分：
+  // liveHistory   = 当前进行中的这次线下见面（真正续写的对象）
+  // backgroundText = 线上聊天、通话、往次已结束的见面（只作背景）
+  function splitOfflineContext(timelineContext, offlineAll, char, user) {
+    const charName = getOfflinePromptCharName(char)
+    const userName = getOfflinePromptUserName(user)
+    const liveHistory = (offlineAll || [])
+      .map(row => ({
+        role: row.role === 'assistant' ? 'assistant' : 'user',
+        content: stripOfflineLabel(row.content || '').trim()
+      }))
+      .filter(m => m.content)
+    if (liveHistory.length) {
+      liveHistory.unshift({ role: 'user', content: '（以下是你们这次线下见面到目前为止的经过。）' })
+    }
+    const liveTimes = new Set((offlineAll || []).map(row => Number(row.createdAt) || 0))
+    const items = Array.isArray(timelineContext?.timeline) ? timelineContext.timeline : []
+    const texts = Array.isArray(timelineContext?.textHistory) ? timelineContext.textHistory : []
+    const lines = []
+    items.forEach((item, i) => {
+      if (!item) return
+      // 当前这次见面的条目已经放进 liveHistory，这里跳过
+      if (item.kind === 'offline' && liveTimes.has(Number(item.time) || 0)) return
+      const text = String(texts[i]?.content ?? item.content ?? '').trim()
+      if (!text) return
+      if (item.kind === 'online') {
+        lines.push(`${item.role === 'assistant' ? charName : userName}：${text}`)
+      } else if (item.kind === 'offline') {
+        lines.push(stripOfflineLabel(text))
+      } else {
+        lines.push(text) // 通话记录自带格式
+      }
+    })
+    return { liveHistory, backgroundText: lines.join('\n') }
+  }
+
+  async function buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings, backgroundText = '') {
     const charName = getOfflinePromptCharName(char)
     const userName = getOfflinePromptUserName(user)
     const relation = buildRelationText(char, user.id || ownerUid)
@@ -1458,10 +1496,11 @@ ${memoryBlock}
 ${antiRepeatBlock}
 
 ## 上下文
-- 微信聊天和线下见面属于同一条连续时间线；记住两边发生过的事，自然承接最近上下文。
-- 当前场景只发生在线下。若历史里出现“之后你们在微信上聊天/线下见面了”等转场提示，只用于理解时间线，不要复述。
+- 对话消息里只有【当前这次线下见面】的经过，请只顺着它续写；若还没有任何线下记录，就当作一次新的见面开场。
+- 微信聊天、语音/视频通话和往次见面只是背景：用来了解你们的近况、关系和情绪，不是当前场景。不要接着通话或聊天的最后一句往下说，不要把通话/聊天里的情境当成正在发生，也不要复述其中的内容。
+- 当前的地点、动作和话题以线下记录为准，不受线上内容影响。
 - 可以感知并回应现场的表情、距离、停顿、视线、手部动作、身体姿态和环境细节。
-
+${backgroundText ? `\n## 线上背景（仅作背景，按时间从早到晚）\n${backgroundText}\n` : ''}
 ${loreAfterBlock}## 回复规则
 - AI必须在每次回复的最开头，强制附加以下结构化状态数据，然后再输出正文：
 <status>
