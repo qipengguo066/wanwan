@@ -7275,7 +7275,7 @@ function hasLaterOnlineEvent(events, currentIndex, afterTime) {
 
 function formatWechatOfflineMessage(row) {
   const speaker = row.role === 'assistant' ? '角色' : '用户'
-  const text = String(row.content || '').trim()
+  const text = String(row.content || '').replace(/线下见面中[，,]\s*(?:角色|用户)\s*[：:]\s*/g, '').trim()
   if (!text) return ''
   return `线下见面中，${speaker}：${text}`
 }
@@ -7858,6 +7858,10 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
     part2
 
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
+  const ttsTagHintChat = await getTTSTagHint('chat', charName)
+  if (ttsTagHintChat) system += '\n\n' + ttsTagHintChat
+  const scheduleCtxChat = await getScheduleContext()
+  if (scheduleCtxChat) system += '\n\n' + scheduleCtxChat
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
   if (idleContext?.enabled && idleContext.mode === 'auto_reply') system += '\n\n' + buildSystemAutoReplyPart(idleContext)
   const requirement = String(replyRequirement || '').trim()
@@ -16582,6 +16586,25 @@ function buildVoiceIdSectionHTML(voiceId) {
       <div class="cs-section-sub">填入 Voice ID，角色语音消息将用 Minimax TTS 生成</div>
       <input class="input-field" id="cs-voice-id" placeholder="输入 Minimax Voice ID" value="${wcEscHtml(voiceId || '')}" style="margin:0 0 8px">
     </div>
+    <div class="cs-section" data-cs-tab="role">
+      <div class="cs-section-label">Fish Audio 音色</div>
+      <div class="cs-section-sub">在「设置 → Fish Audio 语音配置」里把当前语音服务切到 Fish Audio 后生效</div>
+      <input class="input-field" id="cs-fish-voice-id" placeholder="输入或在下方搜索选择 Fish 音色 ID" value="" style="margin:0 0 8px">
+      <div class="cs-fish-row">
+        <input class="input-field" id="cs-fish-search-input" placeholder="搜索音色名称，如：温柔 / 少年" style="margin:0">
+        <button type="button" class="cs-fish-btn" id="cs-fish-search-btn">搜索</button>
+      </div>
+      <div class="cs-fish-row">
+        <select class="input-field" id="cs-fish-lang" style="margin:0">
+          <option value="">全部语言</option>
+          <option value="zh" selected>中文</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+        </select>
+        <button type="button" class="cs-fish-btn" id="cs-fish-mine-btn">我的音色</button>
+      </div>
+      <div class="cs-fish-results" id="cs-fish-results"></div>
+    </div>
   `
 }
 
@@ -16987,6 +17010,10 @@ async function saveChatSettingsPage(settingsPage, chatId, charId, chatPage, char
 
     const voiceId = settingsPage.querySelector('#cs-voice-id')?.value.trim() || ''
     await db.config.put({ key: `chatVoiceId_${chatId}`, value: voiceId })
+    const fishVoiceEl = settingsPage.querySelector('#cs-fish-voice-id')
+    if (fishVoiceEl && fishVoiceEl.dataset.loaded === '1') {
+      await db.config.put({ key: `chatFishVoiceId_${chatId}`, value: fishVoiceEl.value.trim() })
+    }
 
     settingsPage.dataset.csOriginalAvatarSize = String(appearanceValue.avatarSize)
     settingsPage.dataset.csOriginalAvatarRadius = String(appearanceValue.avatarRadius)
@@ -18701,6 +18728,128 @@ function showApiErrorModal(message, diagnostic) {
 // ===== Voice ID 设置事件绑定 =====
 function bindVoiceIdEvents(settingsPage, chatId) {
   // Voice ID 由聊天设置顶栏的统一保存按钮保存。
+  const fishInput = settingsPage.querySelector('#cs-fish-voice-id')
+  const resultsEl = settingsPage.querySelector('#cs-fish-results')
+  if (!fishInput || !resultsEl) return
+
+  db.config.get(`chatFishVoiceId_${chatId}`).then(r => {
+    fishInput.value = r?.value || ''
+    fishInput.dataset.loaded = '1'
+  })
+
+  const searchInput = settingsPage.querySelector('#cs-fish-search-input')
+  const langSelect = settingsPage.querySelector('#cs-fish-lang')
+  const searchBtn = settingsPage.querySelector('#cs-fish-search-btn')
+  const mineBtn = settingsPage.querySelector('#cs-fish-mine-btn')
+  const toast = (t) => window.toast && window.toast(t)
+  const state = { self: false, title: '', language: '', page: 1, total: 0, loading: false, items: new Map() }
+  let previewAudio = null
+  let previewBtn = null
+
+  function stopPreview() {
+    if (previewAudio) { previewAudio.pause(); previewAudio = null }
+    if (previewBtn) { previewBtn.textContent = '试听'; previewBtn = null }
+  }
+
+  function renderItems(items, append) {
+    if (!append) resultsEl.innerHTML = ''
+    items.forEach(it => {
+      state.items.set(it._id, it)
+      const langs = Array.isArray(it.languages) ? it.languages.join('/') : ''
+      const author = it.author?.nickname || ''
+      const meta = [langs, author].filter(Boolean).join(' · ')
+      const hasSample = !!it.samples?.[0]?.audio
+      const row = document.createElement('div')
+      row.className = 'cs-fish-item' + (it._id === fishInput.value.trim() ? ' is-selected' : '')
+      row.dataset.id = it._id
+      row.innerHTML = `
+        <div class="cs-fish-info">
+          <div class="cs-fish-title">${wcEscHtml(it.title || '未命名')}</div>
+          <div class="cs-fish-meta">${wcEscHtml(meta)}</div>
+        </div>
+        ${hasSample ? '<button type="button" class="cs-fish-btn cs-fish-play">试听</button>' : ''}
+        <button type="button" class="cs-fish-btn cs-fish-pick">选用</button>
+      `
+      resultsEl.appendChild(row)
+    })
+    const oldMore = resultsEl.querySelector('.cs-fish-more')
+    if (oldMore) oldMore.remove()
+    if (state.items.size < state.total) {
+      const more = document.createElement('button')
+      more.type = 'button'
+      more.className = 'cs-fish-btn cs-fish-more'
+      more.textContent = '加载更多'
+      resultsEl.appendChild(more)
+    }
+    if (!state.items.size) {
+      resultsEl.innerHTML = '<div class="cs-fish-empty">没有找到音色</div>'
+    }
+  }
+
+  async function loadVoices(reset) {
+    if (state.loading) return
+    state.loading = true
+    if (reset) {
+      state.page = 1
+      state.items = new Map()
+      resultsEl.innerHTML = '<div class="cs-fish-empty">加载中…</div>'
+    } else {
+      state.page += 1
+    }
+    try {
+      const data = await fishListVoices({
+        title: state.title, language: state.language, self: state.self, pageNumber: state.page, pageSize: 10
+      })
+      state.total = data.total || 0
+      renderItems(data.items || [], !reset)
+    } catch (e) {
+      if (!reset) state.page -= 1
+      resultsEl.innerHTML = `<div class="cs-fish-empty">${wcEscHtml(e.message || String(e))}</div>`
+    } finally {
+      state.loading = false
+    }
+  }
+
+  function startSearch(self) {
+    stopPreview()
+    state.self = self
+    state.title = self ? '' : (searchInput.value || '').trim()
+    state.language = self ? '' : (langSelect.value || '')
+    loadVoices(true)
+  }
+
+  searchBtn.addEventListener('click', () => startSearch(false))
+  mineBtn.addEventListener('click', () => startSearch(true))
+  searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); startSearch(false) } })
+
+  resultsEl.addEventListener('click', e => {
+    const btn = e.target.closest('button')
+    if (!btn) return
+    if (btn.classList.contains('cs-fish-more')) { loadVoices(false); return }
+    const row = btn.closest('.cs-fish-item')
+    const item = row && state.items.get(row.dataset.id)
+    if (!item) return
+    if (btn.classList.contains('cs-fish-pick')) {
+      fishInput.value = item._id
+      resultsEl.querySelectorAll('.cs-fish-item').forEach(el => el.classList.toggle('is-selected', el === row))
+      markChatSettingsDirty(settingsPage)
+      toast('已填入音色，记得点右上角保存')
+      return
+    }
+    if (btn.classList.contains('cs-fish-play')) {
+      const wasThis = previewBtn === btn
+      stopPreview()
+      if (wasThis) return
+      const url = item.samples?.[0]?.audio
+      if (!url) return
+      previewAudio = new Audio(url)
+      previewBtn = btn
+      btn.textContent = '停止'
+      previewAudio.addEventListener('ended', stopPreview)
+      previewAudio.addEventListener('error', () => { stopPreview(); toast('试听加载失败') })
+      previewAudio.play().catch(() => { stopPreview(); toast('试听播放失败') })
+    }
+  })
 }
 
 // ===== Minimax TTS 调用 =====
@@ -18779,6 +18928,195 @@ async function callMinimaxTTS(text, voiceId) {
   return URL.createObjectURL(blob)
 }
 
+// ===== Fish Audio TTS =====
+async function getTTSProvider() {
+  const r = await db.config.get('ttsProvider')
+  return r?.value === 'fish' ? 'fish' : 'minimax'
+}
+
+// 按当前语音服务取该聊天的音色 ID（Minimax 和 Fish 的音色 ID 分开存）
+async function getChatVoiceId(chatId) {
+  const provider = await getTTSProvider()
+  const r = await db.config.get(provider === 'fish' ? `chatFishVoiceId_${chatId}` : `chatVoiceId_${chatId}`)
+  return r?.value || ''
+}
+
+async function getFishConfig() {
+  const results = await Promise.all([
+    db.config.get('fishBaseUrl'),
+    db.config.get('fishApiKey'),
+    db.config.get('fishModel')
+  ])
+  return {
+    base: (results[0]?.value || 'https://api.fish.audio').replace(/\/+$/, ''),
+    apiKey: results[1]?.value || '',
+    model: results[2]?.value || ''
+  }
+}
+
+async function fishRequest(cfg, path, init) {
+  let res
+  try {
+    res = await fetch(cfg.base + path, init)
+  } catch (e) {
+    throw new Error('无法连接 Fish Audio：可能没开 VPN，或浏览器被跨域（CORS）拦截。' + (e.message ? '（' + e.message + '）' : ''))
+  }
+  if (!res.ok) {
+    let detail = ''
+    try {
+      const j = await res.json()
+      detail = j?.message || j?.error?.message || (Array.isArray(j) ? JSON.stringify(j[0]?.msg || j[0]) : '')
+    } catch (_) {}
+    const hint = res.status === 401 ? '（API Key 不对）' : res.status === 402 ? '（余额/额度不足）' : ''
+    throw new Error('Fish Audio HTTP ' + res.status + hint + (detail ? '：' + String(detail).slice(0, 300) : ''))
+  }
+  return res
+}
+
+async function callFishTTS(text, voiceId) {
+  const cfg = await getFishConfig()
+  if (!cfg.apiKey) throw new Error('Fish Audio API Key 未配置，请在设置中填写')
+  if (!cfg.model) throw new Error('Fish Audio 语音模型未选择，请在设置中选择模型')
+  if (!voiceId) throw new Error('Fish 音色 ID 未配置，请在聊天设置中填写')
+
+  console.info('[Fish TTS] 发送文字：', text)
+  const res = await fishRequest(cfg, '/v1/tts', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + cfg.apiKey,
+      'model': cfg.model
+    },
+    body: JSON.stringify({
+      text: text,
+      reference_id: voiceId,
+      format: 'mp3',
+      mp3_bitrate: 128,
+      latency: 'normal'
+    })
+  })
+  const blob = await res.blob()
+  if (!blob.size) throw new Error('Fish Audio 未返回音频数据')
+  return URL.createObjectURL(new Blob([blob], { type: 'audio/mpeg' }))
+}
+
+// 角色在文字里用【中文语气】标语气；Fish 朗读前换成 [中文语气]（S2.1 的标签语法，不会被读出来），Minimax 不支持就直接去掉
+function prepareTTSText(text, provider) {
+  const s = String(text || '')
+  if (provider === 'fish') return s.replace(/【([^】\n]{1,30})】/g, '[$1]')
+  return s.replace(/【[^】\n]{0,30}】/g, '').replace(/[ \t]{2,}/g, ' ').trim()
+}
+
+// 统一入口：按当前语音服务生成语音，返回 blob 地址
+async function callTTS(text, voiceId) {
+  const provider = await getTTSProvider()
+  const prepared = prepareTTSText(text, provider)
+  if (!prepared) throw new Error('没有可朗读的文字')
+  return provider === 'fish' ? callFishTTS(prepared, voiceId) : callMinimaxTTS(prepared, voiceId)
+}
+
+// 让角色在语音文字里写语气标签的提示词；只有当前语音服务是 Fish 时才加
+// 想改成英文标签：把下面 TTS_TAG_EXAMPLES 换成 【whispering】【laughing】【sighing】 之类，并改"2-6 个字"那句
+const TTS_TAG_EMOTION_HINTS = '开心：【带着笑意，语调上扬】；温柔：【轻柔缓慢，气息贴近】；难过：【气声，拖着尾音】；哽咽：【声音发颤，带着鼻音】；生气：【压低声音，克制地】；烦躁：【短促，不耐烦地叹气】；惊讶：【吸气，惊讶地】；紧张：【急促，声音发颤】；害羞：【小声，有点结巴】'
+const TTS_TAG_EXAMPLES = '【轻声】【低声】【轻笑】【叹气】【撒娇】【害羞】【生气】【哽咽】【停顿】'
+// 课表上下文（来自设置里导入的 ICS，只放今天，18:00 后加明天）
+async function getScheduleContext() {
+  try {
+    if (window.ScheduleCtx && typeof window.ScheduleCtx.build === 'function') return await window.ScheduleCtx.build()
+  } catch (_) {}
+  return ''
+}
+
+// 通用：点按钮读一段文字（通话记录用）。同一段文字同一音色在本次打开期间只生成一次
+const _speakOnceCache = new Map()
+let _speakOnceAudio = null
+let _speakOnceBtn = null
+function stopSpeakOnce() {
+  if (_speakOnceAudio) { try { _speakOnceAudio.pause() } catch (_) {} _speakOnceAudio = null }
+  if (_speakOnceBtn) { _speakOnceBtn.classList.remove('is-playing', 'is-loading'); _speakOnceBtn = null }
+}
+async function speakTextOnce(chatId, text, btn) {
+  if (_speakOnceBtn === btn) { stopSpeakOnce(); return }
+  stopSpeakOnce()
+  const audio = new Audio()
+  audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  audio.play().catch(() => {})
+  _speakOnceAudio = audio
+  _speakOnceBtn = btn
+  btn.classList.add('is-loading')
+  try {
+    const voiceId = await getChatVoiceId(chatId)
+    if (!voiceId) { window.toast?.('这个角色还没设置音色 ID（聊天设置里填）'); stopSpeakOnce(); return }
+    const key = voiceId + '|' + text
+    let url = _speakOnceCache.get(key)
+    if (!url) {
+      url = await callTTS(text, voiceId)
+      _speakOnceCache.set(key, url)
+      if (_speakOnceCache.size > 20) {
+        const oldest = _speakOnceCache.keys().next().value
+        URL.revokeObjectURL(_speakOnceCache.get(oldest))
+        _speakOnceCache.delete(oldest)
+      }
+    }
+    if (_speakOnceBtn !== btn) return
+    btn.classList.remove('is-loading')
+    btn.classList.add('is-playing')
+    audio.src = url
+    audio.addEventListener('ended', () => { if (_speakOnceBtn === btn) stopSpeakOnce() })
+    await audio.play()
+  } catch (e) {
+    stopSpeakOnce()
+    window.toast?.('朗读失败：' + (e.message || e))
+  }
+}
+
+async function isTTSTagEnabled() {
+  return (await getTTSProvider()) === 'fish'
+}
+async function getTTSTagHint(kind, charName) {
+  if (!(await isTTSTagEnabled())) return ''
+  const rules = `- 标签用中文短语，2-10 个字，可参考：${TTS_TAG_EXAMPLES}。
+- 想要听得出区别，就写得具体一点，按当时的情绪选：${TTS_TAG_EMOTION_HINTS}。
+- 标签放在要影响的那句话前面；每句最多 1 个，整段话总共不超过 3 个，不要连续堆叠，没有明显语气变化就不写。
+- 只用【】，不要用其他括号；标签里只写语气或情绪，不要写动作描写或长句。
+- 标签只写在原文语言的部分，译文里不要写标签。`
+  if (kind === 'chat') {
+    return `# 【语音消息的语气标签】
+发语音消息时，可以在语音文字里用【】标出语气或情绪，之后朗读会更有感情。例如：\`[${charName || '角色'}的语音：【轻声】我到家啦，【轻笑】今天好累]\`
+${rules}
+
+---`
+  }
+  if (kind === 'call') {
+    return `【语气标签】
+"speech" 里可以用【】标出语气或情绪，之后朗读会更有感情。例如：{"scene":"...","speech":"【轻笑】喂？怎么啦，【轻声】突然打电话过来"}
+${rules}
+- 标签写在 speech 字符串里即可，JSON 格式保持合法。`
+  }
+  return ''
+}
+
+// 搜索/拉取 Fish 音色。self=true 只拿自己账号下的音色
+async function fishListVoices(opts) {
+  const o = opts || {}
+  const cfg = await getFishConfig()
+  if (!cfg.apiKey) throw new Error('请先在设置里填写 Fish Audio API Key')
+  const params = new URLSearchParams()
+  params.set('page_size', String(o.pageSize || 10))
+  params.set('page_number', String(o.pageNumber || 1))
+  if (o.self) {
+    params.set('self', 'true')
+  } else {
+    params.set('sort_by', 'score')
+    if (o.title) params.set('title', o.title)
+    if (o.language) params.set('language', o.language)
+  }
+  const res = await fishRequest(cfg, '/model?' + params.toString(), {
+    headers: { 'Authorization': 'Bearer ' + cfg.apiKey }
+  })
+  return res.json()
+}
+
 // ===== 语音音频缓存 =====
 var _voiceAudioPlayer = null
 
@@ -18824,8 +19162,7 @@ window.toggleVoice = async function(bubbleEl) {
   if (!msg || msg.role !== 'assistant') return
 
   const chatId = msg.chatId
-  const voiceIdCfg = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdCfg?.value
+  const voiceId = await getChatVoiceId(chatId)
   if (!voiceId) return
 
   const cached = msg.voiceAudioData
@@ -18842,7 +19179,7 @@ window.toggleVoice = async function(bubbleEl) {
 
   bubbleEl.classList.add('voice-loading')
   try {
-    const blobUrl = await callMinimaxTTS(voiceText, voiceId)
+    const blobUrl = await callTTS(voiceText, voiceId)
     const dataUrl = await blobUrlToDataUrl(blobUrl)
     URL.revokeObjectURL(blobUrl)
     await saveVoiceAudioCache(msgId, dataUrl)
@@ -18873,8 +19210,7 @@ async function autoGenerateVoiceIfNeeded(chatId, msgId, content) {
   const parsed = parseMsgType(content)
   if (parsed.type !== 'voice') return
 
-  const voiceIdCfg = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdCfg?.value
+  const voiceId = await getChatVoiceId(chatId)
   if (!voiceId) return
 
   const bilingualSettings = await getChatBilingualSettings(chatId)
@@ -18882,11 +19218,13 @@ async function autoGenerateVoiceIfNeeded(chatId, msgId, content) {
   if (!voiceText) return
 
   try {
-    const blobUrl = await callMinimaxTTS(voiceText, voiceId)
+    const blobUrl = await callTTS(voiceText, voiceId)
     const dataUrl = await blobUrlToDataUrl(blobUrl)
     URL.revokeObjectURL(blobUrl)
     await saveVoiceAudioCache(msgId, dataUrl)
-  } catch (_) {}
+  } catch (e) {
+    console.warn('语音自动生成失败', e && e.message)
+  }
 }
 
 // HTML转义
@@ -19518,6 +19856,7 @@ let _callHistory = []
 let _callSystemPrompt = ''
 let _callState = 'idle'
 let _callType = null
+let _callAutoSpeak = true // 通话里角色说话是否自动朗读（默认开，记在 db.config.callAutoSpeak）
 let _callStartTime = null
 let _callTimerInterval = null
 let _callChatId = null
@@ -19754,6 +20093,10 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'voice', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  const ttsTagHintVoice = await getTTSTagHint('call', charName)
+  if (ttsTagHintVoice) prompt += ttsTagHintVoice + '\n\n'
+  const scheduleCtxVoice = await getScheduleContext()
+  if (scheduleCtxVoice) prompt += scheduleCtxVoice + '\n\n'
 
   prompt += buildCallOutputFormat('voice') + '\n'
 
@@ -19794,6 +20137,10 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'video', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  const ttsTagHintVideo = await getTTSTagHint('call', charName)
+  if (ttsTagHintVideo) prompt += ttsTagHintVideo + '\n\n'
+  const scheduleCtxVideo = await getScheduleContext()
+  if (scheduleCtxVideo) prompt += scheduleCtxVideo + '\n\n'
 
   if (_realCameraActive) {
     prompt += buildRealCameraPart(charName, userName) + '\n\n'
@@ -19934,6 +20281,11 @@ async function startCall(chatId, charId, type, initiator = 'user') {
     return
   }
 
+  try {
+    const autoCfg = await db.config.get('callAutoSpeak')
+    _callAutoSpeak = autoCfg ? autoCfg.value !== false : true
+  } catch (_) { _callAutoSpeak = true }
+
   const page = document.createElement('div')
   page.id = 'call-page'
   page.className = `full-page call-page ${type === 'video' ? 'video-call-page' : 'voice-call-page'}`
@@ -19977,6 +20329,31 @@ function bindCallEvents(page, type) {
   page.addEventListener('pointerdown', retryPendingCallAudioPlayback)
   page.querySelector('#btn-call-hangup').addEventListener('click', () => endCall())
   page.querySelector('#btn-call-minimize')?.addEventListener('click', () => minimizeCall())
+
+  // 自动朗读开关（右上角）
+  const callContent = page.querySelector('.call-content')
+  if (callContent && !page.querySelector('#btn-call-autospeak')) {
+    const autoBtn = document.createElement('button')
+    autoBtn.type = 'button'
+    autoBtn.id = 'btn-call-autospeak'
+    autoBtn.className = 'call-minimize-btn call-autospeak-btn'
+    const paintAuto = () => {
+      autoBtn.innerHTML = `<i class="fa-solid ${_callAutoSpeak ? 'fa-volume-high' : 'fa-volume-xmark'}"></i>`
+      autoBtn.title = _callAutoSpeak ? '自动朗读：开' : '自动朗读：关'
+    }
+    paintAuto()
+    autoBtn.addEventListener('click', async () => {
+      _callAutoSpeak = !_callAutoSpeak
+      paintAuto()
+      try { await db.config.put({ key: 'callAutoSpeak', value: _callAutoSpeak }) } catch (_) {}
+      if (!_callAutoSpeak) {
+        cancelCallTTSRetry()
+        stopCallAudio()
+      }
+      window.toast?.(_callAutoSpeak ? '自动朗读已开启' : '自动朗读已关闭，可点气泡旁的小喇叭')
+    })
+    callContent.appendChild(autoBtn)
+  }
 
   page.querySelector('#btn-call-mute')?.addEventListener('click', function () {
     this.classList.toggle('active')
@@ -20026,6 +20403,9 @@ function handleCallUserSend(page) {
   _callHistory.push({ role: 'user', content: text })
 
   appendCallUserBubble(page, text)
+
+  // 发送后自动请求角色回复（魔法棒按钮保留，用于失败后重试）
+  if (!_callAISending) sendCallAIRequest(page)
 }
 
 async function handleCallReply(page) {
@@ -20143,7 +20523,7 @@ async function sendCallAIRequest(page) {
     updateCallScene(page, parsed.scene)
     updateCallSpeech(page, parsed.speech)
 
-    playCallTTS(parsed.speech)
+    if (_callAutoSpeak) playCallTTS(parsed.speech)
 
   } catch (e) {
     console.error('通话 AI 请求失败', e)
@@ -20207,10 +20587,14 @@ function updateCallSpeech(page, speechText) {
     div.className = 'call-msg call-msg-assistant'
     const bilingualParsed = helpers.parseBilingualText?.(speechText)
     if (bilingualParsed?.translation) {
-      div.innerHTML = `<span class="call-msg-text"><span class="call-msg-original">${helpers.wcEscHtml?.(bilingualParsed.original) || speechText}</span><span class="call-msg-translation">${helpers.wcEscHtml?.(bilingualParsed.translation) || bilingualParsed.translation}</span></span>`
+      div.innerHTML = `<span class="call-msg-text"><span class="call-msg-original">${helpers.wcEscHtml?.(bilingualParsed.original) || speechText}</span><span class="call-msg-translation">${helpers.wcEscHtml?.(bilingualParsed.translation) || bilingualParsed.translation}</span></span><button type="button" class="call-msg-speak" title="朗读"><i class="fa-solid fa-volume-high"></i></button>`
     } else {
-      div.innerHTML = `<span class="call-msg-text">${helpers.wcEscHtml?.(speechText) || speechText}</span>`
+      div.innerHTML = `<span class="call-msg-text">${helpers.wcEscHtml?.(speechText) || speechText}</span><button type="button" class="call-msg-speak" title="朗读"><i class="fa-solid fa-volume-high"></i></button>`
     }
+    div.querySelector('.call-msg-speak')?.addEventListener('click', e => {
+      e.stopPropagation()
+      playCallTTS(speechText)
+    })
     container.appendChild(div)
     const conversation = page.querySelector('#call-conversation')
     if (conversation) conversation.scrollTop = conversation.scrollHeight
@@ -20331,21 +20715,19 @@ async function playCallTTS(speechText) {
 async function tryPlayCallTTS(speechText, requestSeq) {
   if (_callState === 'idle') return
   try {
-    const voiceIdCfg = await db.config.get(`chatVoiceId_${_callChatId}`)
-    if (_callState === 'idle') return
-    const voiceId = voiceIdCfg?.value
-    if (!voiceId) return
-
     const helpers = h()
-    if (typeof helpers.callMinimaxTTS !== 'function') return
+    if (typeof helpers.callTTS !== 'function' || typeof helpers.getChatVoiceId !== 'function') return
+    const voiceId = await helpers.getChatVoiceId(_callChatId)
+    if (_callState === 'idle') return
+    if (!voiceId) return
     let ttsText = speechText
     const bilingualParsed = helpers.parseBilingualText?.(speechText)
     if (bilingualParsed?.original) {
       ttsText = bilingualParsed.original
     }
 
-    const blobUrl = await helpers.callMinimaxTTS(ttsText, voiceId)
-    if (!blobUrl) throw new Error('Minimax TTS 未返回音频地址')
+    const blobUrl = await helpers.callTTS(ttsText, voiceId)
+    if (!blobUrl) throw new Error('语音合成未返回音频地址')
     if (_callState === 'idle') {
       URL.revokeObjectURL(blobUrl)
       return
@@ -20780,6 +21162,7 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
   const user = ownerUid ? await db.characters.get(ownerUid) : null
   const userName = getCallUserBaseName(user)
   let messagesHTML = ''
+  const callSpeechList = []
   for (const m of (record.messages || [])) {
     if (m.role === 'user') {
       const content = m.content || ''
@@ -20804,7 +21187,8 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
         const speechHTML = bilingualParsed.translation
           ? `<span class="call-detail-original">${callEscHtml(bilingualParsed.original)}</span><span class="call-detail-translation">${callEscHtml(bilingualParsed.translation)}</span>`
           : callEscHtml(speech)
-        messagesHTML += `<div class="call-detail-msg call-detail-assistant"><span class="call-detail-sender">${callEscHtml(charName || '角色')}</span><span class="call-detail-text">${speechHTML}</span></div>`
+        callSpeechList.push(bilingualParsed.original || speech)
+        messagesHTML += `<div class="call-detail-msg call-detail-assistant"><span class="call-detail-sender">${callEscHtml(charName || '角色')}</span><span class="call-detail-text">${speechHTML}</span><button type="button" class="call-detail-speak" data-idx="${callSpeechList.length - 1}" title="朗读"><i class="fa-solid fa-volume-high"></i></button></div>`
       }
     }
   }
@@ -20825,7 +21209,14 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
 
   window.openPage(page)
   page.querySelector('#btn-call-detail-back').addEventListener('click', () => {
+    stopSpeakOnce()
     window.closePage('call-record-detail-page')
+  })
+  page.querySelectorAll('.call-detail-speak').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const text = callSpeechList[parseInt(btn.dataset.idx, 10)]
+      if (text) speakTextOnce(record.chatId, text, btn)
+    })
   })
 }
 
@@ -21085,6 +21476,12 @@ window._wechatCallHelpers = {
   getChatBilingualSettings,
   buildCurrentRelationText,
   callMinimaxTTS,
+  callTTS,
+  getChatVoiceId,
+  getTTSTagHint,
+  isTTSTagEnabled,
+  getScheduleContext,
+  speakTextOnce,
   blobUrlToDataUrl,
   getTimeOfDay,
   getWechatDisplayCharacter,

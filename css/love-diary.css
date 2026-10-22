@@ -764,3 +764,43 @@
   opacity: 0.5;
   cursor: default;
 }
+
+/* ===== 弹窗：标题行的确认图标 + 小窗口可滚动 ===== */
+.center-modal.ld-modal {
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.ld-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ld-title-ok {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: var(--ld-accent);
+  color: #fff;
+  font-size: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-title-ok:disabled {
+  background: #f0d4da;
+  cursor: default;
+}
+
+@media (max-height: 640px) {
+  .ld-text-input { min-height: 64px; }
+}

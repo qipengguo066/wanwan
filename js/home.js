@@ -1400,6 +1400,16 @@ function openMusicWidgetEditor(widgetId) {
   })
 }
 
+// 从纪念日到今天一共多少天，纪念日当天算第 1 天；日期无效返回 null，纪念日在未来显示 0
+function coupleDaysSince(dateStr) {
+  var m = String(dateStr || '').match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!m) return null
+  var start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  var now = new Date()
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  return Math.max(0, Math.round((today - start) / 86400000) + 1)
+}
+
 function openCoupleWidgetEditor(widgetId) {
   var widget = _desktopWidgets.find(function(item) { return item.id === widgetId })
   if (!widget || widget.templateId !== 'couple') return
@@ -1410,7 +1420,9 @@ function openCoupleWidgetEditor(widgetId) {
     name2: '小狗神',
     bubbleLeft: '你在左边',
     bubbleRight: '我靠近右',
-    count: '520'
+    count: '520',
+    countMode: 'manual',
+    anniversary: ''
   }, widget.data || {})
   var overlay = document.createElement('div')
   overlay.className = 'sheet-overlay'
@@ -1435,7 +1447,12 @@ function openCoupleWidgetEditor(widgetId) {
       '<label>昵称「右」<input class="input-field" id="couple-editor-name2" value="' + escapeMainHtml(data.name2) + '"></label>' +
       '<label>气泡「左」<input class="input-field" id="couple-editor-bubble-left" value="' + escapeMainHtml(data.bubbleLeft) + '"></label>' +
       '<label>气泡「右」<input class="input-field" id="couple-editor-bubble-right" value="' + escapeMainHtml(data.bubbleRight) + '"></label>' +
-      '<label>计数<input class="input-field" id="couple-editor-count" value="' + escapeMainHtml(data.count || '520') + '" placeholder="520"></label>' +
+      '<label>计数方式<select class="input-field" id="couple-editor-mode">' +
+        '<option value="manual">手动填写</option>' +
+        '<option value="anniversary">纪念日（自动算天数）</option>' +
+      '</select></label>' +
+      '<label id="couple-editor-count-wrap">计数<input class="input-field" id="couple-editor-count" value="' + escapeMainHtml(data.count || '520') + '" placeholder="520"></label>' +
+      '<label id="couple-editor-date-wrap">纪念日<input class="input-field" id="couple-editor-date" type="date" value="' + escapeMainHtml(data.anniversary || '') + '"></label>' +
       '<div class="angel-editor-actions">' +
         '<button class="btn-pill" id="couple-editor-cancel" type="button">取消</button>' +
         '<button class="btn-pill angel-editor-save" id="couple-editor-save" type="button">保存</button>' +
@@ -1454,6 +1471,15 @@ function openCoupleWidgetEditor(widgetId) {
   }
   overlay.addEventListener('click', close)
   modal.querySelector('#couple-editor-cancel').addEventListener('click', close)
+  var coupleModeSelect = modal.querySelector('#couple-editor-mode')
+  var syncCoupleMode = function() {
+    var isAnniversary = coupleModeSelect.value === 'anniversary'
+    modal.querySelector('#couple-editor-count-wrap').style.display = isAnniversary ? 'none' : ''
+    modal.querySelector('#couple-editor-date-wrap').style.display = isAnniversary ? '' : 'none'
+  }
+  coupleModeSelect.value = data.countMode === 'anniversary' ? 'anniversary' : 'manual'
+  coupleModeSelect.addEventListener('change', syncCoupleMode)
+  syncCoupleMode()
   modal.querySelector('#couple-editor-left-avatar').addEventListener('click', function() {
     window.showImagePicker(function(imageUrl) {
       data.avatar1 = imageUrl
@@ -1469,6 +1495,12 @@ function openCoupleWidgetEditor(widgetId) {
     })
   })
   modal.querySelector('#couple-editor-save').addEventListener('click', async function() {
+    var coupleMode = coupleModeSelect.value === 'anniversary' ? 'anniversary' : 'manual'
+    var coupleDate = modal.querySelector('#couple-editor-date').value
+    if (coupleMode === 'anniversary' && !coupleDate) {
+      if (window.toast) window.toast('请先选择纪念日')
+      return
+    }
     widget.data = Object.assign({}, widget.data || {}, {
       avatar1: data.avatar1 || 'img/ava-01.jpg',
       avatar2: data.avatar2 || 'img/ava-02.jpg',
@@ -1476,7 +1508,9 @@ function openCoupleWidgetEditor(widgetId) {
       name2: modal.querySelector('#couple-editor-name2').value.trim() || '小狗神',
       bubbleLeft: modal.querySelector('#couple-editor-bubble-left').value.trim() || '你在左边',
       bubbleRight: modal.querySelector('#couple-editor-bubble-right').value.trim() || '我靠近右',
-      count: modal.querySelector('#couple-editor-count').value.trim() || '520'
+      count: modal.querySelector('#couple-editor-count').value.trim() || '520',
+      countMode: coupleMode,
+      anniversary: coupleDate || ''
     })
     await saveDesktopWidgets()
     var liveWidget = document.querySelector('.desktop-widget[data-id="' + widget.id + '"]')
@@ -2285,8 +2319,9 @@ function buildDesktopWidgetInner(widget) {
     var coupleName1 = data.name1 === '月亮O.o' ? '弯弯O.o' : (data.name1 || '弯弯O.o')
     var coupleBubbleLeft = data.bubbleLeft || '你在左边'
     var coupleBubbleRight = data.bubbleRight || '我靠近右'
-    var coupleCount = data.count || '520'
-    return '<div class="couple-bubbles-row"><div class="couple-bubble-item couple-bubble-left-note"><span>' + escapeMainHtml(coupleBubbleLeft) + '</span></div><div class="couple-bubble-item couple-bubble-right-note"><span>' + escapeMainHtml(coupleBubbleRight) + '</span></div></div><div class="couple-avatars-main"><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar1) + '" alt=""></div><div class="name">' + escapeMainHtml(coupleName1) + '</div></div><div class="couple-ekg"><svg viewBox="0 0 64 22" preserveAspectRatio="none"><polyline points="0,11 6,11 9,14 13,8 17,11 21,11 25,2 31,20 35,11 64,11" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg></div><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar2) + '" alt=""></div><div class="name">' + escapeMainHtml(data.name2 || '小狗神') + '</div></div></div><div class="couple-days-area"><div class="couple-days-label">我们已经相爱</div><div class="couple-days-value">' + escapeMainHtml(coupleCount) + ' days</div></div>'
+    var coupleDays = data.countMode === 'anniversary' ? coupleDaysSince(data.anniversary) : null
+    var coupleCount = coupleDays !== null ? String(coupleDays) : (data.count || '520')
+    return '<div class="couple-bubbles-row"><div class="couple-bubble-item couple-bubble-left-note"><span>' + escapeMainHtml(coupleBubbleLeft) + '</span></div><div class="couple-bubble-item couple-bubble-right-note"><span>' + escapeMainHtml(coupleBubbleRight) + '</span></div></div><div class="couple-avatars-main"><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar1) + '" alt=""></div><div class="name">' + escapeMainHtml(coupleName1) + '</div></div><div class="couple-ekg"><svg viewBox="0 0 64 22" preserveAspectRatio="none"><polyline points="0,11 6,11 9,14 13,8 17,11 21,11 25,2 31,20 35,11 64,11" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg></div><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar2) + '" alt=""></div><div class="name">' + escapeMainHtml(data.name2 || '小狗神') + '</div></div></div><div class="couple-days-area"><div class="couple-days-label">正式在一起已经</div><div class="couple-days-value">' + escapeMainHtml(coupleCount) + ' days</div></div>'
   }
   if (widget.templateId === 'calendar') {
     var calAvatar = data.avatar || 'img/ava-00.jpg'

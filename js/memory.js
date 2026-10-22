@@ -712,9 +712,12 @@ ${lines}`
     return JSON.parse(s)
   }
 
+  // 提示词让模型写 150 字以内，但模型常常略超；这里放宽上限，避免句子写到一半被截断。手动编辑同样适用
+  var MEMORY_CONTENT_MAX = 600
+
   function normalizeMemory(raw, meta) {
     var title = String(raw?.title || '').trim().slice(0, 30) || '未命名记忆'
-    var content = String(raw?.content || '').trim().slice(0, 150)
+    var content = String(raw?.content || '').trim().slice(0, MEMORY_CONTENT_MAX)
     if (!content) return null
     var now = isValidTimestamp(meta.createdAt) ? Number(meta.createdAt) : Date.now()
     return {
@@ -998,7 +1001,7 @@ ${lines}`
       <div class="sheet-title">${isNew ? '新增记忆' : '编辑记忆'}</div>
       <div class="memory-edit-form">
         <input class="input-field" id="mem-edit-title" placeholder="标题" value="${esc(m.title)}">
-        <textarea class="input-field" id="mem-edit-content" placeholder="内容，150字以内">${esc(m.content)}</textarea>
+        <textarea class="input-field" id="mem-edit-content" placeholder="内容（建议 150 字以内，最多 ${MEMORY_CONTENT_MAX} 字）">${esc(m.content)}</textarea>
         <input class="input-field" id="mem-edit-keywords" placeholder="关键词，用逗号分隔" value="${esc((m.keywords || []).join(','))}">
         <label class="memory-edit-label">发生时间
           <input class="input-field" id="mem-edit-source-at" type="datetime-local" step="1" value="${esc(formatDateTimeLocal(m.sourceAt))}">
@@ -1040,7 +1043,7 @@ ${lines}`
       var sourceAt = sourceAtInput ? new Date(sourceAtInput).getTime() : null
       var patch = {
         title: modal.querySelector('#mem-edit-title').value.trim().slice(0, 30) || '未命名记忆',
-        content: modal.querySelector('#mem-edit-content').value.trim().slice(0, 150),
+        content: modal.querySelector('#mem-edit-content').value.trim().slice(0, MEMORY_CONTENT_MAX),
         keywords: modal.querySelector('#mem-edit-keywords').value.split(/[,，]/).map(function(k) { return k.trim() }).filter(Boolean),
         valence: clamp(modal.querySelector('#mem-edit-valence').value, -1, 1, 0),
         arousal: clamp(modal.querySelector('#mem-edit-arousal').value, 0, 1, 0.3),

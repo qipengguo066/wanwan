@@ -10,6 +10,7 @@
   const LD_SORT_DESC = true        // true：新的在上；false：旧的在上
   const LD_MAX_EVENT_LEN = 300
   const LD_MEMORY_CANDIDATES = 30  // “翻记忆”时，每次最多给 TA 看多少条候选记忆
+  const LD_COMMENT_CANDIDATES = 8  // “翻记忆”顺便让 TA 看的、还没有任何备注的事（最近的 N 条）
   const ldLocks = {}
 
   // ===== 通用小工具 =====
@@ -441,6 +442,23 @@
       }, 220)
     }
     if (!sticky) overlay.addEventListener('click', close)
+
+    // 弹窗太高、被键盘或小窗口挡住底部按钮时，标题右上角还有一个“确认”图标可用
+    const okBtn = modal.querySelector('.ld-actions:not(.ld-actions-one) .ld-btn-ok')
+    const titleEl = modal.querySelector('.ld-modal-title')
+    if (okBtn && titleEl) {
+      titleEl.classList.add('ld-title-row')
+      const quick = document.createElement('button')
+      quick.type = 'button'
+      quick.className = 'ld-title-ok'
+      quick.setAttribute('aria-label', '确认')
+      quick.innerHTML = '<i class="fa-solid fa-check"></i>'
+      quick.disabled = okBtn.disabled
+      quick.addEventListener('click', () => { if (!okBtn.disabled) okBtn.click() })
+      titleEl.appendChild(quick)
+      new MutationObserver(() => { quick.disabled = okBtn.disabled })
+        .observe(okBtn, { attributes: true, attributeFilter: ['disabled'] })
+    }
     return { modal, close }
   }
 
@@ -1254,7 +1272,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
     page._ldPicking = true
     const btnHTML = btn.innerHTML
     btn.disabled = true
-    btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> TA 正在翻记忆…'
+    btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> TA 正在翻记忆、看帖子…'
     try {
       const events = await ldLoad(ownerUid, charId)
       const used = new Set(events.filter(e => e.fromMemoryId != null).map(e => String(e.fromMemoryId)))
@@ -1263,25 +1281,42 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
         .sort((a, b) =>
           (Number(b.importance) || 0) - (Number(a.importance) || 0) ||
           (ldTs(b.sourceAt) || ldTs(b.createdAt)) - (ldTs(a.sourceAt) || ldTs(a.createdAt)))
-      if (!mems.length) {
-        ldToast('记忆库里没有可以挑的新记忆了')
+      const cands = mems.slice(0, LD_MEMORY_CANDIDATES)
+      // 用户自己记的、还没有任何备注的事，取最近的几条，让 TA 顺便决定要不要评论（同一次请求里完成）
+      const postCands = events.slice()
+        .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || (ldTs(b.createdAt) - ldTs(a.createdAt)))
+        .filter(e => e.authorType === 'self' && !(e.notes && e.notes.length))
+        .slice(0, LD_COMMENT_CANDIDATES)
+      if (!cands.length && !postCands.length) {
+        ldToast('记忆库里没有可以挑的新记忆，也没有还没评论的事')
         return
       }
-      const cands = mems.slice(0, LD_MEMORY_CANDIDATES)
 
       const ctx = await ldCollectContext(ownerUid, charId, { date: ldDayOf(Date.now()), text: '', notes: [], authorType: 'role' })
-      const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
-${ctx.persona || '暂无额外设定。'}
-${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
-你和「${ctx.userName}」一起维护着一本“恋爱记”，按日期记录你们之间发生过、值得留下的事。现在请你从下面的记忆里，挑出最值得记进恋爱记的一件事。
-规则：
-· 只能从下面编号的记忆里挑，只挑一条。
+      const tasks = []
+      if (cands.length) {
+        tasks.push(`【任务一：记一件事】从下面编号的记忆里，挑出最值得记进恋爱记的一件事，只挑一条。
 · 优先挑：关系的转折、第一次、重要的约定、难忘的见面或对话。日常闲聊和琐碎信息不挑。
 · 不要挑和“恋爱记里已有的事”重复或几乎一样的。
 · 把它写成一句话，30 字以内，用你自己的口吻，可以用“我们”。只写记忆里确实有的内容，不要添油加醋。
-· 只输出一行，格式严格如下，不要任何解释：
-  选｜记忆编号｜这件事
-  如果这些记忆都不值得记，只输出：无
+· 输出一行：选｜记忆编号｜这件事
+· 如果这些记忆都不值得记，输出一行：无`)
+      }
+      if (postCands.length) {
+        tasks.push(`【任务${cands.length ? '二' : '一'}：看看还没有备注的事】下面有几件${ctx.userName}记下、还没有任何备注的事。想留备注的就留，不想留的不用留，也可以一条都不留。
+· 每件事最多留一条，用「我」的口吻，像平时和${ctx.userName}说话那样，一两句话，最多 80 字，贴着这件事本身，别套话，别总结升华。
+· 聊天、见面、记忆里确实出现过的细节可以用，没出现过的事不要编。
+· 每条备注单独输出一行：评｜事件编号｜备注正文（备注正文里不要换行，不要带名字前缀和引号）`)
+      }
+      const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
+${ctx.persona || '暂无额外设定。'}
+${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它当成你所处世界的事实：\n${ctx.loreText}\n` : ''}
+你和「${ctx.userName}」一起维护着一本“恋爱记”，按日期记录你们之间发生过、值得留下的事。这一次有下面的任务：
+
+${tasks.join('\n\n')}
+
+总规则：
+· 只输出上面规定格式的行，每行一条，不要任何解释、标题或多余文字。
 · 不要输出任何双花括号包裹的模板占位符。`
 
       const parts = []
@@ -1291,13 +1326,25 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
           `- ${e.date} ${e.authorType === 'role' ? ctx.friendName : ctx.userName}：${ctx.resolve(e.text)}`
         ).join('\n'))
       }
-      parts.push('【可以挑的记忆】\n' + cands.map((m, i) => {
-        const ts = ldTs(m.sourceAt)
-        const when = ts ? ldDayOf(ts) : '时间未知'
-        const src = (m.sourceType ? m.sourceType === 'offlineMeet' : !!m.sourceSessionId) ? '线下' : '线上'
-        return `#${i + 1} [${when}｜${src}｜重要度${m.importance || 5}] ${ctx.resolve(`${m.title || ''}：${m.content || ''}`)}`
-      }).join('\n'))
-      parts.push('请挑出最值得记的一件事。')
+      if (cands.length) {
+        parts.push('【可以挑的记忆】\n' + cands.map((m, i) => {
+          const ts = ldTs(m.sourceAt)
+          const when = ts ? ldDayOf(ts) : '时间未知'
+          const src = (m.sourceType ? m.sourceType === 'offlineMeet' : !!m.sourceSessionId) ? '线下' : '线上'
+          return `#${i + 1} [${when}｜${src}｜重要度${m.importance || 5}] ${ctx.resolve(`${m.title || ''}：${m.content || ''}`)}`
+        }).join('\n'))
+      }
+      if (postCands.length) {
+        parts.push('【还没有备注的事】\n' + postCands.map((e, i) =>
+          `E${i + 1} [${e.date}｜${ctx.userName}记的] ${ctx.resolve(e.text)}`
+        ).join('\n'))
+        const refs = []
+        if (ctx.memLines.length) refs.push(`【相关记忆】\n${ctx.memLines.join('\n')}`)
+        if (ctx.recentChat.length) refs.push(`【最近的线上聊天】\n${ctx.recentChat.join('\n')}`)
+        if (ctx.recentOffline.length) refs.push(`【最近的线下见面】\n${ctx.recentOffline.join('\n')}`)
+        if (refs.length) parts.push('以下只是供你参考的背景，别照搬原文：\n\n' + refs.join('\n\n'))
+      }
+      parts.push('请按规定的格式输出。')
 
       const callOpts = { system: systemPrompt }
       if (window.getAITemperaturePreset) {
@@ -1307,46 +1354,75 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
       const raw = await window.callAI([{ role: 'user', content: parts.join('\n\n') }], callOpts)
       const answer = String(raw == null ? '' : raw).replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
       const lines = answer.split('\n').map(x => x.trim()).filter(Boolean)
-      const hit = lines.map(l => l.match(/^选\s*[｜|]\s*#?(\d+)\s*[｜|]\s*(.+)$/)).find(Boolean)
-      if (!hit) {
-        if (lines.some(l => /^无/.test(l))) {
-          ldToast('TA 觉得这些记忆里暂时没有新的值得记的事')
-          return
-        }
+      const pickHit = cands.length ? lines.map(l => l.match(/^选\s*[｜|]\s*#?(\d+)\s*[｜|]\s*(.+)$/)).find(Boolean) : null
+      const commentHits = postCands.length ? lines.map(l => l.match(/^评\s*[｜|]\s*#?E?(\d+)\s*[｜|]\s*(.+)$/i)).filter(Boolean) : []
+      const saidNone = lines.some(l => /^无/.test(l))
+      if (!pickHit && !commentHits.length && !saidNone) {
         const err = new Error('没有从模型的返回里读到可用的结果，请重试')
         err.rawOutput = answer
         throw err
       }
-      const mem = cands[parseInt(hit[1], 10) - 1]
-      if (!mem) {
-        const err = new Error('模型选的记忆编号不存在，请重试')
+
+      // 两件事各自独立：一边的内容不可用，不影响另一边
+      let mem = null
+      let text = ''
+      if (pickHit) {
+        mem = cands[parseInt(pickHit[1], 10) - 1] || null
+        text = ldResolvePlaceholders(pickHit[2], ctx).replace(/^["“「『]+|["”」』]+$/g, '').trim().slice(0, 60)
+        if (!mem || !text) mem = null
+      }
+      const notesToAdd = []
+      const usedEv = new Set()
+      commentHits.forEach(h => {
+        const ev = postCands[parseInt(h[1], 10) - 1]
+        if (!ev || usedEv.has(ev.id)) return
+        const t = ldCleanReply(h[2], ctx)
+        if (!t) return
+        usedEv.add(ev.id)
+        notesToAdd.push({ eventId: ev.id, text: t })
+      })
+      if (!mem && !notesToAdd.length) {
+        if (!pickHit && !commentHits.length) {
+          ldToast('TA 觉得暂时没有新的值得记的事，也没有想评论的')
+          return
+        }
+        const err = new Error('模型返回的编号不存在或内容为空，请重试')
         err.rawOutput = answer
         throw err
       }
-      const text = ldResolvePlaceholders(hit[2], ctx).replace(/^["“「『]+|["”」』]+$/g, '').trim().slice(0, 60)
-      if (!text) throw new Error('模型没有写出事件内容，请重试')
-      const memTs = ldTs(mem.sourceAt) || ldTs(mem.createdAt) || Date.now()
-      const date = ldDayOf(memTs)
 
+      const memTs = mem ? (ldTs(mem.sourceAt) || ldTs(mem.createdAt) || Date.now()) : 0
+      const date = mem ? ldDayOf(memTs) : ''
       await ldUpdate(ownerUid, charId, list => {
-        if (list.some(e => e.fromMemoryId != null && String(e.fromMemoryId) === String(mem.id))) return
-        list.push({
-          id: ldMakeId('ev'),
-          date,
-          text,
-          authorType: 'role',
-          fromMemoryId: mem.id,
-          createdAt: Date.now(),
-          notes: []
+        if (mem && !list.some(e => e.fromMemoryId != null && String(e.fromMemoryId) === String(mem.id))) {
+          list.push({
+            id: ldMakeId('ev'),
+            date,
+            text,
+            authorType: 'role',
+            fromMemoryId: mem.id,
+            createdAt: Date.now(),
+            notes: []
+          })
+        }
+        notesToAdd.forEach(n => {
+          const e2 = list.find(e => e.id === n.eventId)
+          if (e2 && !(e2.notes && e2.notes.length)) {
+            e2.notes = e2.notes || []
+            e2.notes.push(ldMakeNote(n.text, 'role', ctx.friendName, null, charId))
+          }
         })
       })
-      ldToast(`${ctx.friendName}记下了一件事（${ldShortDay(date)}）`)
+      const done = []
+      if (mem) done.push(`记下了一件事（${ldShortDay(date)}）`)
+      if (notesToAdd.length) done.push(`评论了 ${notesToAdd.length} 件事`)
+      ldToast(`${ctx.friendName}${done.join('，')}`)
       if (document.body.contains(page)) await ldRenderTimeline(page)
     } catch (e) {
       const msg = e?.message || String(e)
       const isConfigError = /API|配置|Base URL|Key|模型/.test(msg) && !e?.rawOutput
       ldShowError({
-        title: '翻记忆失败',
+        title: '翻记忆 / 评论失败',
         message: isConfigError ? '请先检查设置里的 API 配置。' : msg,
         detail: msg + (e?.rawOutput ? '\n\n模型原始返回：\n' + String(e.rawOutput).slice(0, 2000) : '')
       })
