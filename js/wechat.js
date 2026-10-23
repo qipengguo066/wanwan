@@ -7052,7 +7052,9 @@ function buildWechatOnlineTurnUnits(events) {
   return units
 }
 
-function buildWechatRoundTimeline(roundUnits) {
+function buildWechatRoundTimeline(roundUnits, options = {}) {
+  // 已结束且已总结进长期记忆的线下见面，默认只留一句话占位，不再把整段原文发给线上聊天/通话
+  const collapseSummarizedOffline = options.collapseSummarizedOffline !== false
   const result = []
   const units = Array.isArray(roundUnits) ? roundUnits : []
 
@@ -7087,6 +7089,16 @@ function buildWechatRoundTimeline(roundUnits) {
     if (unit.kind !== 'offline-round') return
     const session = unit.session
     if (!session || !session.messages?.length) return
+    if (collapseSummarizedOffline && session.ended && session.summarized) {
+      const d = new Date(session.startAt || session.endAt || Date.now())
+      result.push({
+        kind: 'offline',
+        time: session.endAt || session.startAt || 0,
+        role: 'user',
+        content: `（之后你们线下见面过一次（${d.getMonth() + 1}月${d.getDate()}日）。这次见面已经结束，并已总结进你的长期记忆，具体经过以长期记忆为准；之后你们回到微信聊天。）`
+      })
+      return
+    }
     result.push({
       kind: 'offline',
       time: session.startAt || 0,
@@ -7250,6 +7262,7 @@ function buildWechatOfflineSessions(rows) {
     const ended = messages.some(m => m.endedAt)
     return {
       ended,
+      summarized: messages.some(m => m.meetSummaryStatus === 'summarized'),
       startAt: messages[0]?.createdAt || 0,
       endAt: Math.max(...messages.map(m => m.createdAt || 0)),
       messages
@@ -7731,6 +7744,14 @@ async function refreshChat(chatPage, options = {}) {
 
 
 // 合并全局世界书 + 本对话挂载的局部世界书（分段版：{ before, middle, after }）
+// 世界书条目标题以「[线上]」或「[线下]」开头时，只在对应场景使用（也兼容【线上】【线下】）。
+// scene: 'online'（微信聊天/通话/群聊）| 'offline'（想见你）；没写前缀的条目两边都用。
+function loreEntryMatchesScene(entry, scene) {
+  const m = String(entry?.title || '').match(/^\s*[\[【]\s*(线上|线下)\s*[\]】]/)
+  if (!m) return true
+  return (m[1] === '线上') === (scene !== 'offline')
+}
+
 async function getChatLorebookContextSegments(chatId, charId, recentMsgs) {
   const dialogText = recentMsgs.map(m => m.content || '').join(' ')
   const allBooks = (await db.config.get('lorebooks'))?.value || []
@@ -7743,6 +7764,7 @@ async function getChatLorebookContextSegments(chatId, charId, recentMsgs) {
     if (book.scope === 'personal' && !ids.includes(charId)) continue
     for (const entry of book.entries || []) {
       if (!entry.enabled) continue
+      if (!loreEntryMatchesScene(entry, 'online')) continue
       const hit = !entry.keywords?.length || entry.keywords.some(kw => kw && dialogText.includes(kw))
       if (hit) matched.push(entry)
     }
@@ -7760,6 +7782,7 @@ async function getChatLorebookContextSegments(chatId, charId, recentMsgs) {
       && !(b.charIds || []).includes(charId)
     )) {
       for (const entry of (book.entries || []).filter(e => e.enabled !== false)) {
+        if (!loreEntryMatchesScene(entry, 'online')) continue
         const hit = !entry.keywords?.length || entry.keywords.some(kw => dialogText.includes(kw))
         if (hit) matched.push(entry)
       }
@@ -19875,6 +19898,113 @@ let _realCameraActive = false
 let _realCameraFacingMode = 'user'
 let _callRecognition = null
 let _callRecognitionTimeout = null
+
+// ===== 通话自动保存 / 闲置自动挂断 =====
+// 通话内容原来只在点「挂断」时才写进数据库；现在每条消息都会存一份草稿（db.config 的 callDraft），
+// 清后台/闪退后下次打开会自动补成通话记录。
+const CALL_DRAFT_KEY = 'callDraft'
+const CALL_IDLE_LIMIT_MS = 2 * 60 * 60 * 1000 // 超过这个时间没人说话，自动挂断（改这里的数字即可）
+let _callLastActivity = 0
+let _callIdleTimer = null
+
+async function saveCallDraft() {
+  if (_callState === 'idle' || !_callChatId || !_callStartTime) return
+  try {
+    await db.config.put({
+      key: CALL_DRAFT_KEY,
+      value: {
+        chatId: _callChatId,
+        charId: _callCharId,
+        ownerUid: window._wechatUid,
+        type: _callType || 'voice',
+        initiator: _callInitiator,
+        startTime: _callStartTime,
+        lastActivity: _callLastActivity || Date.now(),
+        messages: _callHistory.map(m => ({
+          role: m.role,
+          content: m.content,
+          scene: m.scene || undefined,
+          speech: m.speech || undefined,
+          timestamp: m.timestamp || Date.now()
+        }))
+      }
+    })
+  } catch (e) { console.warn('保存通话草稿失败', e) }
+}
+
+async function clearCallDraft() {
+  try { await db.config.delete(CALL_DRAFT_KEY) } catch (_) {}
+}
+
+function stopCallIdleWatch() {
+  if (_callIdleTimer) { clearInterval(_callIdleTimer); _callIdleTimer = null }
+}
+
+function checkCallIdle() {
+  if (_callState !== 'connected' || !_callLastActivity) return
+  if (_callAISending) return
+  if (Date.now() - _callLastActivity < CALL_IDLE_LIMIT_MS) return
+  stopCallIdleWatch()
+  window.toast?.('太久没有说话，通话已自动挂断')
+  // 通话时长只算到最后一次说话的时间
+  endCall({ endAt: _callLastActivity })
+}
+
+function startCallIdleWatch() {
+  if (_callIdleTimer) return
+  _callIdleTimer = setInterval(checkCallIdle, 60 * 1000)
+}
+
+// 上次通话没正常挂断（清后台、闪退）→ 把草稿补成通话记录
+async function recoverCallDraft() {
+  if (_callState !== 'idle') return
+  let draft = null
+  try { draft = (await db.config.get(CALL_DRAFT_KEY))?.value } catch (_) { return }
+  if (!draft || !draft.chatId || !draft.startTime) { if (draft) await clearCallDraft(); return }
+  const msgs = Array.isArray(draft.messages) ? draft.messages : []
+  const endAt = draft.lastActivity || draft.startTime
+  const duration = Math.max(0, Math.floor((endAt - draft.startTime) / 1000))
+  try {
+    const dup = await db.callRecords.where('chatId').equals(draft.chatId)
+      .filter(r => r.createdAt === draft.startTime).count()
+    if (!dup && duration > 0 && msgs.length) {
+      const callRecordId = await db.callRecords.add({
+        chatId: draft.chatId,
+        charId: draft.charId,
+        ownerUid: draft.ownerUid,
+        type: draft.type || 'voice',
+        initiator: draft.initiator || 'user',
+        duration,
+        messages: msgs,
+        createdAt: draft.startTime,
+        recovered: true
+      })
+      const mm = String(Math.floor(duration / 60)).padStart(2, '0')
+      const ss = String(duration % 60).padStart(2, '0')
+      const typeLabel = draft.type === 'video' ? '视频通话' : '语音通话'
+      await addPrivateMessageIdempotently({
+        chatId: draft.chatId,
+        charId: draft.charId,
+        role: draft.initiator === 'char' ? 'assistant' : 'user',
+        content: `[${typeLabel} ${mm}:${ss}]`,
+        callRecordId,
+        createdAt: endAt
+      })
+      window.toast?.('上次没挂断的通话已自动保存')
+      if (typeof refreshVisibleWechatChatList === 'function') refreshVisibleWechatChatList({ showLoading: false })
+    }
+    await clearCallDraft()
+  } catch (e) { console.error('恢复通话草稿失败', e) }
+}
+
+// 回到前台时：先检查是不是闲置超时；页面被杀后重新打开时：补存草稿
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { saveCallDraft(); return }
+  checkCallIdle()
+  recoverCallDraft()
+})
+window.addEventListener('pagehide', () => { saveCallDraft() })
+setTimeout(() => { if (typeof db !== 'undefined' && db?.config) recoverCallDraft() }, 3000)
 let _callMinimized = false
 
 const CALL_TTS_RETRY_DELAY_MS = 3000
@@ -20401,6 +20531,8 @@ function handleCallUserSend(page) {
   retryPendingCallAudioPlayback()
 
   _callHistory.push({ role: 'user', content: text })
+  _callLastActivity = Date.now()
+  saveCallDraft()
 
   appendCallUserBubble(page, text)
 
@@ -20519,6 +20651,9 @@ async function sendCallAIRequest(page) {
       _callStartTime = Date.now()
       startCallTimer(page)
     }
+    _callLastActivity = Date.now()
+    startCallIdleWatch()
+    saveCallDraft()
 
     updateCallScene(page, parsed.scene)
     updateCallSpeech(page, parsed.speech)
@@ -20982,13 +21117,18 @@ function dispatchCallStateChange() {
 
 // ===== 结束通话 =====
 
-async function endCall() {
+async function endCall(opts = {}) {
   const chatId = _callChatId
   const charId = _callCharId
   const type = _callType
   const initiator = _callInitiator
-  const duration = getCallDurationSeconds()
-  const durationStr = formatCallDuration()
+  // opts.endAt：闲置自动挂断时，时长只算到最后一次说话
+  const endAt = (opts && typeof opts.endAt === 'number' && _callStartTime) ? opts.endAt : null
+  const duration = endAt ? Math.max(0, Math.floor((endAt - _callStartTime) / 1000)) : getCallDurationSeconds()
+  const durationStr = endAt
+    ? `${String(Math.floor(duration / 60)).padStart(2, '0')}:${String(duration % 60).padStart(2, '0')}`
+    : formatCallDuration()
+  stopCallIdleWatch()
   const history = [..._callHistory]
   const startTime = _callStartTime || Date.now()
 
@@ -21049,9 +21189,12 @@ async function endCall() {
       console.error('保存通话消息失败', e)
     }
   }
+  await clearCallDraft()
 }
 
 function resetCallState() {
+  stopCallIdleWatch()
+  _callLastActivity = 0
   cancelCallTTSRetry()
   _callTTSCanceledRetrySeqs = new Set()
   _callHistory = []

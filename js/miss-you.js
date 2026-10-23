@@ -1306,7 +1306,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const key = pendingKey(state.ownerUid, state.chat.id, state.mode)
     if (_missYouPending.has(key)) return
     _missYouPending.add(key)
-    stopMissSpeech() // 用户已经继续往下聊，先停掉上一条的朗读
+    // 不再在发送时停掉上一条朗读：让它自然播完；新回复生成后自动朗读时会替换它
     applyMissPending(page, true)
     ;(async () => {
       try {
@@ -1387,8 +1387,8 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       content: m.content || ''
     }))
     const loreCtx = window.getLorebookContextSegments
-      ? await window.getLorebookContextSegments(chat.charId, recentForLore)
-      : (window.getLorebookContext ? await window.getLorebookContext(chat.charId, recentForLore) : '')
+      ? await window.getLorebookContextSegments(chat.charId, recentForLore, { scene: 'offline' })
+      : (window.getLorebookContext ? await window.getLorebookContext(chat.charId, recentForLore, { scene: 'offline' }) : '')
     const memoryCtx = window.WanWanMemory?.getMemoryContext
       ? await window.WanWanMemory.getMemoryContext(chat.id, chat.charId, ownerUid, timelineContext.loreMessages)
       : ''
@@ -1581,7 +1581,7 @@ ${memoryCtx}`
       content: m.content || ''
     }))
     const loreCtx = window.getLorebookContext
-      ? await window.getLorebookContext(chat.charId, recentForLore)
+      ? await window.getLorebookContext(chat.charId, recentForLore, { scene: 'offline' })
       : ''
     const char = await window.getCharacter(chat.charId)
     const user = await getMaskUser(ownerUid, chat.id, mode)
