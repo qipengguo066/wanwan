@@ -1,6 +1,8 @@
 /* love-diary.css - 恋爱记 页面样式（沿用 iCity 的圆角、字号、留白） */
 
-.ld-page {
+/* 弹窗是挂在 #app 下的，不在 .ld-page 里面，所以颜色变量也要给弹窗定义一份，否则确认图标/保存按钮的背景会变透明 */
+.ld-page,
+.center-modal.ld-modal {
   --ld-accent: #e58ca0;
   --ld-line: #f0d4da;
   --ld-soft: #fdf3f5;
