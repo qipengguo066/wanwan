@@ -6570,6 +6570,23 @@ function prefixWechatTimeAnchorToContent(content, anchor) {
   return `${anchor}\n${String(content || '')}`
 }
 
+// 给时间锚点加上“相对现在”的日期说明：今天 / 昨天 / 前天 / N天前，避免把前一天的事算到今天
+function getWechatRelativeDayLabel(timestamp, tzConfig) {
+  try {
+    const zone = getWechatTimeContextZones(tzConfig)[0]
+    const k1 = getWechatCalendarDateKey(timestamp, zone.timeZone)
+    const k0 = getWechatCalendarDateKey(Date.now(), zone.timeZone)
+    if (!k1 || !k0) return ''
+    const toDay = k => { const [y, m, d] = k.split('-').map(Number); return Date.UTC(y, m - 1, d) / 86400000 }
+    const diff = Math.round(toDay(k0) - toDay(k1))
+    if (diff === 0) return '今天'
+    if (diff === 1) return '昨天'
+    if (diff === 2) return '前天'
+    if (diff > 2) return `${diff}天前`
+  } catch (_) {}
+  return ''
+}
+
 function injectWechatHistoryTimeAnchors(messages, timeline, tzConfig) {
   const sourceMessages = Array.isArray(messages) ? messages : []
   const sourceTimeline = Array.isArray(timeline) ? timeline : []
@@ -6591,7 +6608,7 @@ function injectWechatHistoryTimeAnchors(messages, timeline, tzConfig) {
     if (!timeText) return { ...message }
     return {
       ...message,
-      content: prefixWechatTimeAnchorToContent(message.content, `[系统时间：${timeText}]`)
+      content: prefixWechatTimeAnchorToContent(message.content, `[系统时间：${timeText}${getWechatRelativeDayLabel(timestamp, tzConfig) ? `（${getWechatRelativeDayLabel(timestamp, tzConfig)}）` : ''}]`)
     }
   })
 }
@@ -8054,7 +8071,8 @@ function buildSystemPart2(timeStr, tod, userName, userNick, currentRelationText,
 你需要同时理解当前时间与聊天记录中的历史时间锚点。判断用户是在描述当下、回忆过去还是安排未来时，应结合消息发送时间、上下文语义与当前时间，不要只凭某个时间词武断判断。
 执行规则：
 1. 你的状态、行为、可能正在做的事情，必须与当前时间段（${tod}）逻辑一致。
-2. 只有在用户明确描述“此刻”且内容与当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。`
+2. 只有在用户明确描述“此刻”且内容与当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。
+3. 聊天记录里的“[系统时间：…（昨天/前天/N天前）]”标记了其后消息发生的日期。标记为昨天或更早的事（吃过的饭、睡过的觉、做过的事）属于那一天，不要当成今天已经发生的事；今天的饭、觉、活动只按标记为“今天”的内容和当前时间来算。`
     : `- **当前时间**：${timeStr}（${tod}）`
   return `# 【Part 2: 当前情景】
 
@@ -8077,7 +8095,8 @@ function buildSystemPart2Tz(charName, charLoc, charTime, charTod, userName, user
 执行规则：
 1. ${charName}的状态、行为、可能正在做的事情，必须与${charTod}逻辑一致；判断与${userName}相关的时间逻辑（例如对方是否方便接听、是否在睡觉）时，须以${userTod}为准。
 2. 若双方日期或时段存在显著差异，应在确实影响当前话题时自然体现这种差异，不要机械报时。
-3. 只有在用户明确描述“此刻”且内容与其所在地当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。`
+3. 只有在用户明确描述“此刻”且内容与其所在地当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。
+3. 聊天记录里的“[系统时间：…（昨天/前天/N天前）]”标记了其后消息发生的日期。标记为昨天或更早的事（吃过的饭、睡过的觉、做过的事）属于那一天，不要当成今天已经发生的事；今天的饭、觉、活动只按标记为“今天”的内容和当前时间来算。`
     : `- **当前时间**：此时${charName}处于${charLoc}，当前时间为${charTime}（${charTod}）；${userName}处于${userLoc}，当前时间为${userTime}（${userTod}）`
   return `# 【Part 2: 当前情景】
 
@@ -20459,6 +20478,9 @@ function bindCallEvents(page, type) {
   page.addEventListener('pointerdown', retryPendingCallAudioPlayback)
   page.querySelector('#btn-call-hangup').addEventListener('click', () => endCall())
   page.querySelector('#btn-call-minimize')?.addEventListener('click', () => minimizeCall())
+  // 点通话页任意位置（包括点输入框）都先解锁一次音频，这样回车发送后也能自动朗读
+  page.addEventListener('touchend', unlockCallAudioPlayback, { passive: true })
+  page.addEventListener('click', unlockCallAudioPlayback)
 
   // 自动朗读开关（右上角）
   const callContent = page.querySelector('.call-content')
@@ -20765,12 +20787,38 @@ function getCallDurationSeconds() {
 
 // ===== TTS =====
 
+// iPhone 只允许“被触摸解锁过的音频元素”在没有手势时自动播放。回车发送不算触摸，
+// 所以通话里全程复用同一个 Audio 元素：点屏幕时解锁一次，之后每条语音只换 src。
+let _callSharedAudio = null
+const CALL_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+function getCallSharedAudio() {
+  if (!_callSharedAudio) {
+    _callSharedAudio = new Audio()
+    _callSharedAudio.preload = 'auto'
+  }
+  return _callSharedAudio
+}
+
 function unlockCallAudioPlayback() {
   const keepAliveAudio = document.getElementById('keepalive-audio')
-  if (!keepAliveAudio) return
+  if (keepAliveAudio) {
+    try {
+      keepAliveAudio.volume = 0
+      keepAliveAudio.play().catch(() => {})
+    } catch (_) {}
+  }
   try {
-    keepAliveAudio.volume = 0
-    keepAliveAudio.play().catch(() => {})
+    const a = getCallSharedAudio()
+    if (a._callUnlocked || _callAudioBlobUrl) return
+    a.src = CALL_SILENT_WAV
+    const p = a.play()
+    if (p && p.then) {
+      p.then(() => {
+        a._callUnlocked = true
+        if (String(a.src).startsWith('data:audio/wav')) a.pause()
+      }).catch(() => {})
+    }
   } catch (_) {}
 }
 
@@ -20815,14 +20863,16 @@ async function playCallAudioBlob(blobUrl) {
   stopCallAudio()
   _callPendingAudioBlobUrl = null
   _callAudioBlobUrl = blobUrl
-  _callAudioPlayer = new Audio(blobUrl)
-  _callAudioPlayer.addEventListener('ended', () => {
-    _callAudioPlayer = null
+  const sharedAudio = getCallSharedAudio()
+  _callAudioPlayer = sharedAudio
+  sharedAudio.onended = () => {
+    if (_callAudioPlayer === sharedAudio) _callAudioPlayer = null
     if (_callAudioBlobUrl === blobUrl) _callAudioBlobUrl = null
     URL.revokeObjectURL(blobUrl)
-  })
+  }
+  sharedAudio.src = blobUrl
   try {
-    await _callAudioPlayer.play()
+    await sharedAudio.play()
     clearCallAudioPlayRetry()
   } catch (e) {
     console.warn('通话音频播放失败', e.name || e.message || e)
@@ -20878,6 +20928,7 @@ async function tryPlayCallTTS(speechText, requestSeq) {
 function stopCallAudio() {
   clearCallAudioPlayRetry()
   if (_callAudioPlayer) {
+    _callAudioPlayer.onended = null
     _callAudioPlayer.pause()
     _callAudioPlayer = null
   }
