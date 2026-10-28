@@ -115,6 +115,8 @@ const CHAT_TIME_GAP_MS = 10 * 60 * 1000
 // “重回”版本只在当前页面运行期保留，不写入任何持久化存储。
 const _privateReplyVersions = new Map()
 const _activeReplyTriggeredFingerprints = new Map()
+const _activeReplyFailCount = new Map() // 主动回复连续失败次数（后台失败不弹窗，之前会因此再也不重试）
+const _activeReplyRetryAfter = new Map() // 失败后多久之后才允许重试
 let _wechatActiveReplyMonitorStarted = false
 // 聊天首屏只渲染最近这么多条消息，往上点「加载更早」再补一窗，避免长聊天 DOM 过大致 iOS Safari 内存崩溃
 const WECHAT_RENDER_WINDOW = 60
@@ -5876,12 +5878,14 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       const notify = await getChatMsgNotifySettings(chatId)
       const thoughtTemplate = await getChatThoughtTemplateConfig(chatId)
-      let { thought, status, reply } = await generateAIReply(chatId, charId, {
+      const _aiResult = await generateAIReply(chatId, charId, {
         replyRequirement: options.replyRequirement,
         idleTriggerMode: options.idleTriggerMode,
         idleMinutes: options.idleMinutes,
+        impulseHint: options.impulseHint,
         allowMcp: options.allowMcp === true
       })
+      let { thought, status, reply } = _aiResult
       if (thoughtTemplate.enabled) {
         if (!thought || !String(thought).trim()) {
           const char = await window.getCharacter(charId)
@@ -5900,6 +5904,8 @@ function startPrivateAIReply(chatId, charId, options = {}) {
         thought = null
       }
       await updateCharacterStatusFromAI(chatId, charId, status)
+      await applyCharScheduleFromReply(chatId, charId, _aiResult)
+      _activeReplyFailCount.delete(chatId)
       const lines = splitMessageLines(reply)
       const base = Date.now()
       for (let i = 0; i < lines.length; i++) {
@@ -5979,6 +5985,22 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       else console.warn('[wechat] AI 回复失败:', e)
       if (e.diagnostic) console.warn('[wechat] AI 回复诊断:', e.diagnostic)
+      // 主动回复失败：10 分钟后重试，最多连续 3 次（以前失败后会一直等到下一条新消息才可能再触发）
+      if (options.idleTriggerMode) {
+        const fails = (_activeReplyFailCount.get(chatId) || 0) + 1
+        _activeReplyFailCount.set(chatId, fails)
+        if (fails < 3) {
+          _activeReplyTriggeredFingerprints.delete(chatId)
+          _activeReplyRetryAfter.set(chatId, Date.now() + 10 * 60 * 1000)
+        }
+        if (options.scheduleDueId) {
+          try {
+            const d = await charScheduleLoad()
+            const ev = d.events.find(x => x.id === options.scheduleDueId)
+            if (ev) { delete ev.notifiedAt; await charScheduleSave(d) }
+          } catch (_) {}
+        }
+      }
     } finally {
       _pendingAIReplies.delete(key)
       applyTypingUI('chat', chatId, false)
@@ -6311,7 +6333,16 @@ function normalizeWechatAIFields(parsed) {
   if (!visibleLines.length) throw new Error('AI 返回格式异常，请重新发送一次')
   if (thought.length > _WECHAT_THOUGHT_MAX) thought = thought.slice(0, _WECHAT_THOUGHT_MAX)
 
-  return { thought, status, reply }
+  let event = null
+  if (parsed.event && typeof parsed.event === 'object' && !Array.isArray(parsed.event)) {
+    event = {
+      title: typeof parsed.event.title === 'string' ? parsed.event.title : '',
+      start_in_minutes: parsed.event.start_in_minutes,
+      duration_minutes: parsed.event.duration_minutes
+    }
+  }
+  const eventDone = parsed.event_done === true || parsed.event_done === 'true'
+  return { thought, status, reply, event, eventDone }
 }
 
 // 组装报错诊断信息（结合 fetchAI 记录的最近一次响应元数据）
@@ -6367,6 +6398,7 @@ async function runWechatActiveReplyCheck() {
       if (!cfg.enabled) continue
       if (isNowInQuietHours(cfg)) continue
       if (isAIReplyPending('chat', chat.id)) continue
+      if ((_activeReplyRetryAfter.get(chat.id) || 0) > Date.now()) continue
       if (window.isCallActiveWith?.(chat.charId)) continue
       const char = await db.characters.get(chat.charId)
       if (!char || char.type === 'online_friend') continue
@@ -6374,13 +6406,37 @@ async function runWechatActiveReplyCheck() {
       if (!lastMessage) continue
       if (lastMessage.role !== 'assistant' && lastMessage.role !== 'user') continue
       const idleMs = Date.now() - (Number(lastMessage.createdAt) || 0)
-      if (!Number.isFinite(idleMs) || idleMs < cfg.intervalMinutes * 60 * 1000) continue
+      if (!Number.isFinite(idleMs)) continue
+      // 角色日程：他正在忙（上班/执飞…）就不打扰；到了预计结束时间还没报平安，就提前触发一次
+      const sched = await getCharScheduleState(chat.id)
+      if (sched.active) continue
+      let scheduleDue = null
+      if (sched.overdue && !sched.overdue.notifiedAt && Date.now() - sched.overdue.endAt >= 2 * 60000) {
+        if ((Number(lastMessage.createdAt) || 0) > sched.overdue.endAt) {
+          // 预计结束之后聊天里已经有新消息，不再单独提醒
+          sched.overdue.notifiedAt = Date.now()
+          await charScheduleSave(sched.data)
+        } else {
+          scheduleDue = sched.overdue
+        }
+      }
+      if (!scheduleDue && idleMs < cfg.intervalMinutes * 60 * 1000) continue
       const fingerprint = buildActiveReplyTriggerFingerprint(chat.id, lastMessage)
-      if (_activeReplyTriggeredFingerprints.get(chat.id) === fingerprint) continue
+      if (!scheduleDue && _activeReplyTriggeredFingerprints.get(chat.id) === fingerprint) continue
       _activeReplyTriggeredFingerprints.set(chat.id, fingerprint)
+      if (scheduleDue) {
+        scheduleDue.notifiedAt = Date.now()
+        await charScheduleSave(sched.data)
+      }
+      const triggerMode = lastMessage.role === 'assistant' ? 'followup' : 'auto_reply'
+      const impulseHint = (!scheduleDue && triggerMode === 'followup')
+        ? await buildActiveReplyImpulse(chat.id, idleMs)
+        : ''
       startPrivateAIReply(chat.id, chat.charId, {
-        idleTriggerMode: lastMessage.role === 'assistant' ? 'followup' : 'auto_reply',
-        idleMinutes: Math.max(1, Math.floor(idleMs / 60000))
+        idleTriggerMode: triggerMode,
+        idleMinutes: Math.max(1, Math.floor(idleMs / 60000)),
+        impulseHint,
+        scheduleDueId: scheduleDue ? scheduleDue.id : ''
       })
     } catch (err) {
       console.warn('[wechat] 主动回复巡检失败:', err)
@@ -6395,6 +6451,12 @@ function ensureWechatActiveReplyMonitorStarted() {
   setInterval(() => {
     runWechatActiveReplyCheck().catch(err => console.warn('[wechat] 主动回复巡检异常:', err))
   }, CHAT_ACTIVE_REPLY_CHECK_MS)
+  // 从后台/锁屏回到前台时立刻巡检一次，不用等下一个 2 分钟
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      runWechatActiveReplyCheck().catch(err => console.warn('[wechat] 主动回复巡检异常:', err))
+    }
+  })
 }
 
 async function getChatHistoryLimit(chatId) {
@@ -6570,6 +6632,23 @@ function prefixWechatTimeAnchorToContent(content, anchor) {
   return `${anchor}\n${String(content || '')}`
 }
 
+// 给时间锚点加上“相对现在”的日期说明：今天 / 昨天 / 前天 / N天前，避免把前一天的事算到今天
+function getWechatRelativeDayLabel(timestamp, tzConfig) {
+  try {
+    const zone = getWechatTimeContextZones(tzConfig)[0]
+    const k1 = getWechatCalendarDateKey(timestamp, zone.timeZone)
+    const k0 = getWechatCalendarDateKey(Date.now(), zone.timeZone)
+    if (!k1 || !k0) return ''
+    const toDay = k => { const [y, m, d] = k.split('-').map(Number); return Date.UTC(y, m - 1, d) / 86400000 }
+    const diff = Math.round(toDay(k0) - toDay(k1))
+    if (diff === 0) return '今天'
+    if (diff === 1) return '昨天'
+    if (diff === 2) return '前天'
+    if (diff > 2) return `${diff}天前`
+  } catch (_) {}
+  return ''
+}
+
 function injectWechatHistoryTimeAnchors(messages, timeline, tzConfig) {
   const sourceMessages = Array.isArray(messages) ? messages : []
   const sourceTimeline = Array.isArray(timeline) ? timeline : []
@@ -6591,7 +6670,7 @@ function injectWechatHistoryTimeAnchors(messages, timeline, tzConfig) {
     if (!timeText) return { ...message }
     return {
       ...message,
-      content: prefixWechatTimeAnchorToContent(message.content, `[系统时间：${timeText}]`)
+      content: prefixWechatTimeAnchorToContent(message.content, `[系统时间：${timeText}${getWechatRelativeDayLabel(timestamp, tzConfig) ? `（${getWechatRelativeDayLabel(timestamp, tzConfig)}）` : ''}]`)
     }
   })
 }
@@ -6621,6 +6700,14 @@ function buildPromptContextEstimateSummary(charCounts) {
 }
 
 function buildPromptContextEstimateHTML(summary) {
+  if (!summary) {
+    return `
+    <div class="cs-section cs-token-estimate">
+      <div class="cs-section-label">Token 预估</div>
+      <div class="cs-token-estimate-note">计算中…</div>
+    </div>
+  `
+  }
   const stats = buildPromptContextEstimateSummary(summary)
   const rows = [
     ['fa-brands fa-weixin', '微信聊天记录', stats.wechatChars, 'data-icon-wechat'],
@@ -7690,7 +7777,7 @@ async function generateAIReply(chatId, charId, options = {}) {
     scope: 'chat',
     conversationId: chatId
   }, context.textHistory || history)
-  const system = await buildChatSystem(char, loreSegments, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, options.replyRequirement, idleContext)
+  const system = await buildChatSystem(char, loreSegments, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, options.replyRequirement, idleContext, chatId)
   const avatarCtx = await buildWechatAvatarContext(charId)
   const nowTimestamp = Date.now()
   const gapContext = calculateWechatReplyGap(context.gapTimeline || context.timeline, options, nowTimestamp)
@@ -7810,7 +7897,8 @@ async function getPrivateReplyIdleContext(chatId, options = {}) {
       enabled: true,
       mode: triggerMode,
       idleMinutes: Number.isFinite(explicitIdleMinutes) ? Math.max(1, explicitIdleMinutes) : 1,
-      lastAssistantMessageCreatedAt: 0
+      lastAssistantMessageCreatedAt: 0,
+      impulseHint: String(options?.impulseHint || '')
     }
   }
   const messages = await db.messages.where('chatId').equals(Number(chatId)).sortBy('createdAt')
@@ -7830,7 +7918,7 @@ async function getPrivateReplyIdleContext(chatId, options = {}) {
 
 
 // 构建聊天系统提示词（loreCtx 可为字符串或 { before, middle, after } 分段对象）
-async function buildChatSystem(char, loreCtx, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, replyRequirement = '', idleContext = null) {
+async function buildChatSystem(char, loreCtx, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, replyRequirement = '', idleContext = null, chatId = null) {
   const loreSeg = (loreCtx && typeof loreCtx === 'object')
     ? loreCtx
     : { before: '', middle: loreCtx || '', after: '' }
@@ -7885,7 +7973,10 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
   if (ttsTagHintChat) system += '\n\n' + ttsTagHintChat
   const scheduleCtxChat = await getScheduleContext()
   if (scheduleCtxChat) system += '\n\n' + scheduleCtxChat
+  const charSchedChat = await getCharScheduleContext(chatId, charName)
+  if (charSchedChat) system += '\n\n' + charSchedChat
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
+  if (idleContext?.enabled && idleContext.mode === 'followup' && idleContext.impulseHint) system += '\n\n' + idleContext.impulseHint
   if (idleContext?.enabled && idleContext.mode === 'auto_reply') system += '\n\n' + buildSystemAutoReplyPart(idleContext)
   const requirement = String(replyRequirement || '').trim()
   if (requirement) {
@@ -7998,6 +8089,8 @@ function buildSystemPart5(charName, userName, thoughtTemplate) {
 ${thoughtLine}
 - "status"：${charName}当前状态，**每轮必须更新**，必须简洁，1-15字左右，例如 "正在聊天"、"刚洗完澡"、"有点困"。不要写长句、不要加标点、不要写成对话。
 - "reply"：实际发给${userName}的内容，多条消息之间用 \\n 隔开。**必须至少包含一条可见聊天消息，不得只写状态更新格式。**
+- "event"（可选，没有就不要写这个字段）：当${charName}在这一轮消息里说出了一件会占用他一段时间、之后才能回消息的具体安排（上班、执飞、开会、出差、上课、出门办事等），填 {"title":"事件名，10字内","start_in_minutes":从现在起多少分钟后开始（马上开始填0）,"duration_minutes":预计持续多少分钟}。时长按事情的实际情况合理估算（比如执飞按航程），只填数字，不要写“明天”“待会儿”这类相对时间的文字。
+- "event_done"（可选）：当${charName}在这一轮消息里表示自己忙完了、落地了、下班了，填 true。
 
 ✅ 正确：{"chain":"用户语气冲，可能累了…先稳住。","thought":"他今天心情不好，我得小心点…","status":"正在聊天","reply":"怎么了？\\n发生什么事了吗"}
 ✅ 无长推理：{"chain":"","thought":"他今天心情不好，我得小心点…","status":"有点担心","reply":"怎么了？\\n发生什么事了吗"}
@@ -8054,7 +8147,8 @@ function buildSystemPart2(timeStr, tod, userName, userNick, currentRelationText,
 你需要同时理解当前时间与聊天记录中的历史时间锚点。判断用户是在描述当下、回忆过去还是安排未来时，应结合消息发送时间、上下文语义与当前时间，不要只凭某个时间词武断判断。
 执行规则：
 1. 你的状态、行为、可能正在做的事情，必须与当前时间段（${tod}）逻辑一致。
-2. 只有在用户明确描述“此刻”且内容与当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。`
+2. 只有在用户明确描述“此刻”且内容与当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。
+3. 聊天记录里的“[系统时间：…（昨天/前天/N天前）]”标记了其后消息发生的日期。标记为昨天或更早的事（吃过的饭、睡过的觉、做过的事）属于那一天，不要当成今天已经发生的事；今天的饭、觉、活动只按标记为“今天”的内容和当前时间来算。`
     : `- **当前时间**：${timeStr}（${tod}）`
   return `# 【Part 2: 当前情景】
 
@@ -8077,7 +8171,8 @@ function buildSystemPart2Tz(charName, charLoc, charTime, charTod, userName, user
 执行规则：
 1. ${charName}的状态、行为、可能正在做的事情，必须与${charTod}逻辑一致；判断与${userName}相关的时间逻辑（例如对方是否方便接听、是否在睡觉）时，须以${userTod}为准。
 2. 若双方日期或时段存在显著差异，应在确实影响当前话题时自然体现这种差异，不要机械报时。
-3. 只有在用户明确描述“此刻”且内容与其所在地当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。`
+3. 只有在用户明确描述“此刻”且内容与其所在地当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。
+3. 聊天记录里的“[系统时间：…（昨天/前天/N天前）]”标记了其后消息发生的日期。标记为昨天或更早的事（吃过的饭、睡过的觉、做过的事）属于那一天，不要当成今天已经发生的事；今天的饭、觉、活动只按标记为“今天”的内容和当前时间来算。`
     : `- **当前时间**：此时${charName}处于${charLoc}，当前时间为${charTime}（${charTod}）；${userName}处于${userLoc}，当前时间为${userTime}（${userTod}）`
   return `# 【Part 2: 当前情景】
 
@@ -8993,6 +9088,9 @@ async function showMsgMenu(anchorEl, msgId, context) {
 }
 
 // 定位菜单
+// iPhone 弹出输入法时，可见区域(visualViewport)会和整页(layout viewport)错开：
+// 以前按整页高度算位置，菜单会跑到可见区域之外，要收起输入法再上滑才能看到。
+// 现在把菜单限制在“当前真正看得到的区域”里。
 function positionMsgMenu(menu, bubbleEl) {
   const rect = bubbleEl.getBoundingClientRect()
   const gap = 8
@@ -9000,15 +9098,20 @@ function positionMsgMenu(menu, bubbleEl) {
   const menuRect = menu.getBoundingClientRect()
   const menuWidth = menuRect.width
   const menuHeight = menuRect.height
-  const viewportWidth = window.innerWidth
-  const viewportHeight = window.innerHeight
-  const maxLeft = Math.max(edge, viewportWidth - menuWidth - edge)
-  const left = Math.min(Math.max(rect.left, edge), maxLeft)
+  const vv = window.visualViewport
+  const vTop = vv ? vv.offsetTop : 0
+  const vLeft = vv ? vv.offsetLeft : 0
+  const vWidth = vv ? vv.width : window.innerWidth
+  const vHeight = vv ? vv.height : window.innerHeight
+  const minLeft = vLeft + edge
+  const maxLeft = Math.max(minLeft, vLeft + vWidth - menuWidth - edge)
+  const left = Math.min(Math.max(rect.left, minLeft), maxLeft)
+  const minTop = vTop + edge
+  const maxTop = Math.max(minTop, vTop + vHeight - menuHeight - edge)
   const topAbove = rect.top - menuHeight - gap
   const topBelow = rect.bottom + gap
-  const top = topAbove >= edge
-    ? topAbove
-    : Math.min(topBelow, Math.max(edge, viewportHeight - menuHeight - edge))
+  let top = topAbove >= minTop ? topAbove : topBelow
+  top = Math.min(Math.max(top, minTop), maxTop)
   menu.style.top = top + 'px'
   menu.style.left = left + 'px'
 }
@@ -15910,68 +16013,91 @@ async function showStartChatModal(page) {
 
 
 // ===== 聊天设置页 =====
+let _chatSettingsOpening = false
 async function openChatSettings(chatId, charId, chatPage) {
-  const char = await window.getCharacter(charId)
-  const profile = await getWechatProfile(_wechatUid, charId)
-  const memory = await db.config.get(`chatMemory_${chatId}`)
-  const memoryValue = typeof memory?.value === 'object' ? memory.value.historyLimit : memory?.value
-  const historyLimit = clampWechatMemoryLimit(memoryValue)
-  const settingsPage = document.createElement('div')
-  settingsPage.id = 'chat-settings-page'
-  settingsPage.className = 'full-page'
-  settingsPage.dataset.charName = getWechatDisplayName(char)
-  const mounted = await db.config.get(`chatLore_${chatId}`)
-  const lorebooksRaw = await db.config.get('lorebooks')
-  const lorebooks = lorebooksRaw?.value || []
-  const mountedIds = normalizeChatLoreMountIds(mounted?.value, lorebooks, charId)
-  if (!areChatLoreMountIdsEqual(mounted?.value, mountedIds)) {
-    await db.config.put({ key: `chatLore_${chatId}`, value: mountedIds })
+  // 防止在页面还没出来时连点，打开多个设置页叠在一起造成闪烁
+  if (_chatSettingsOpening) return
+  _chatSettingsOpening = true
+  try {
+    // 这些读取互不依赖，一起并行读，比一个一个等快得多
+    const [
+      char, profile, memory, mounted, lorebooksRaw, appearance, stickerCats, mountedStickerIds,
+      tzStored, statusDisplay, activeReplySettings, timeSettings, bilingualSettings, imageGenSettings,
+      stickerImageInputEnabled, thoughtTemplateStored, thoughtPresets, chatBeautyStored, chatBeautyPresets,
+      longMemorySettings, longMemoryCount, voiceIdStored, msgNotify
+    ] = await Promise.all([
+      window.getCharacter(charId),
+      getWechatProfile(_wechatUid, charId),
+      db.config.get(`chatMemory_${chatId}`),
+      db.config.get(`chatLore_${chatId}`),
+      db.config.get('lorebooks'),
+      db.config.get(`chatAppearance_${chatId}`),
+      getAllStickerCategories(),
+      getMountedStickerCatIds(chatId),
+      db.config.get(`chatTimezone_${chatId}`),
+      getChatStatusDisplayConfig(chatId),
+      getChatActiveReplySettings(chatId),
+      getChatTimeSettings(chatId),
+      getChatBilingualSettings(chatId),
+      getChatImageGenSettings(chatId),
+      getChatStickerImageInputEnabled(chatId),
+      db.config.get(`chatThoughtTemplate_${chatId}`),
+      getThoughtPresets(),
+      db.config.get(`chatBeauty_${chatId}`),
+      getChatBeautyPresets(),
+      window.WanWanMemory?.getSettings
+        ? window.WanWanMemory.getSettings(chatId)
+        : Promise.resolve({ enabled: true, summarizeEvery: 30, injectLimit: 12, embeddingEnabled: false, decayStrength: 'medium' }),
+      db.memories
+        ? db.memories.where('chatId').equals(chatId).filter(m => m.ownerUid === _wechatUid && m.charId === charId).count()
+        : Promise.resolve(0),
+      db.config.get(`chatVoiceId_${chatId}`),
+      getChatMsgNotifySettings(chatId)
+    ])
+    const memoryValue = typeof memory?.value === 'object' ? memory.value.historyLimit : memory?.value
+    const historyLimit = clampWechatMemoryLimit(memoryValue)
+    const settingsPage = document.createElement('div')
+    settingsPage.id = 'chat-settings-page'
+    settingsPage.className = 'full-page'
+    settingsPage.dataset.charName = getWechatDisplayName(char)
+    const lorebooks = lorebooksRaw?.value || []
+    const mountedIds = normalizeChatLoreMountIds(mounted?.value, lorebooks, charId)
+    if (!areChatLoreMountIdsEqual(mounted?.value, mountedIds)) {
+      await db.config.put({ key: `chatLore_${chatId}`, value: mountedIds })
+    }
+    const appearanceValue = normalizeChatAppearance(appearance?.value)
+    // 同时拉取每个分组下表情数量，便于在设置页显示
+    const counts = await Promise.all(stickerCats.map(c => db.stickers.where('categoryId').equals(c.id).count()))
+    const stickerCounts = {}
+    stickerCats.forEach((c, i) => { stickerCounts[c.id] = counts[i] })
+    const tzConfig = tzStored?.value || {}
+    const thoughtTemplateRaw = thoughtTemplateStored ? thoughtTemplateStored.value || {} : { enabled: true }
+    const chatBeautyRaw = chatBeautyStored?.value || {}
+    const voiceId = voiceIdStored?.value || ''
+    settingsPage.innerHTML = buildChatSettingsHTML(
+      char, profile, historyLimit,
+      lorebooks, mountedIds, appearanceValue,
+      stickerCats, mountedStickerIds, stickerCounts, tzConfig, statusDisplay, timeSettings, thoughtTemplateRaw, thoughtPresets,
+      activeReplySettings,
+      bilingualSettings, imageGenSettings, stickerImageInputEnabled,
+      chatBeautyRaw, chatBeautyPresets,
+      longMemorySettings, longMemoryCount,
+      null, // Token 预估最耗时（要把整段聊天记录、记忆、世界书都拼一遍），页面打开之后再补
+      voiceId, msgNotify
+    )
+    window.openPage(settingsPage)
+    bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char)
+    estimateWechatPromptContext(chatId, charId, _wechatUid, historyLimit).then(estimate => {
+      const slot = settingsPage.querySelector('.cs-token-estimate')
+      if (slot && settingsPage.isConnected) slot.outerHTML = buildPromptContextEstimateHTML(estimate)
+    }).catch(err => {
+      console.warn('[wechat] Token 预估失败', err)
+      const note = settingsPage.querySelector('.cs-token-estimate .cs-token-estimate-note')
+      if (note) note.textContent = '预估失败，不影响使用。'
+    })
+  } finally {
+    _chatSettingsOpening = false
   }
-  const appearance = await db.config.get(`chatAppearance_${chatId}`)
-  const appearanceValue = normalizeChatAppearance(appearance?.value)
-  const stickerCats = await getAllStickerCategories()
-  const mountedStickerIds = await getMountedStickerCatIds(chatId)
-  // 同时拉取每个分组下表情数量，便于在设置页显示
-  const stickerCounts = {}
-  for (const c of stickerCats) {
-    stickerCounts[c.id] = await db.stickers.where('categoryId').equals(c.id).count()
-  }
-  const tzStored = await db.config.get(`chatTimezone_${chatId}`)
-  const tzConfig = tzStored?.value || {}
-  const statusDisplay = await getChatStatusDisplayConfig(chatId)
-  const activeReplySettings = await getChatActiveReplySettings(chatId)
-  const timeSettings = await getChatTimeSettings(chatId)
-  const bilingualSettings = await getChatBilingualSettings(chatId)
-  const imageGenSettings = await getChatImageGenSettings(chatId)
-  const stickerImageInputEnabled = await getChatStickerImageInputEnabled(chatId)
-  const thoughtTemplateStored = await db.config.get(`chatThoughtTemplate_${chatId}`)
-  const thoughtTemplateRaw = thoughtTemplateStored ? thoughtTemplateStored.value || {} : { enabled: true }
-  const thoughtPresets = await getThoughtPresets()
-  const chatBeautyRaw = (await db.config.get(`chatBeauty_${chatId}`))?.value || {}
-  const chatBeautyPresets = await getChatBeautyPresets()
-  const longMemorySettings = window.WanWanMemory?.getSettings
-    ? await window.WanWanMemory.getSettings(chatId)
-    : { enabled: true, summarizeEvery: 30, injectLimit: 12, embeddingEnabled: false, decayStrength: 'medium' }
-  const longMemoryCount = db.memories
-    ? await db.memories.where('chatId').equals(chatId).filter(m => m.ownerUid === _wechatUid && m.charId === charId).count()
-    : 0
-  const promptEstimate = await estimateWechatPromptContext(chatId, charId, _wechatUid, historyLimit)
-  const voiceIdStored = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdStored?.value || ''
-  const msgNotify = await getChatMsgNotifySettings(chatId)
-  settingsPage.innerHTML = buildChatSettingsHTML(
-    char, profile, historyLimit,
-    lorebooks, mountedIds, appearanceValue,
-    stickerCats, mountedStickerIds, stickerCounts, tzConfig, statusDisplay, timeSettings, thoughtTemplateRaw, thoughtPresets,
-    activeReplySettings,
-    bilingualSettings, imageGenSettings, stickerImageInputEnabled,
-    chatBeautyRaw, chatBeautyPresets,
-    longMemorySettings, longMemoryCount,
-    promptEstimate,
-    voiceId, msgNotify
-  )
-  window.openPage(settingsPage)
-  bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char)
 }
 
 // 聊天设置HTML
@@ -19050,6 +19176,141 @@ async function getScheduleContext() {
   return ''
 }
 
+// ===== 角色日程：角色在聊天里说过的安排（上班、执飞、开会……）=====
+// 思路：角色回复时顺带输出 event（开始多久后、持续多久），代码换算成具体的开始/结束时间并存起来；
+// 之后聊天、通话里都会带上这份日程，主动回复也会看它：忙的时候不打扰，到点还没报平安就提醒他。
+// 相对时间不入库：只存换算后的具体时间；时长缺失或不合理的直接丢弃，不猜。
+const CHAR_SCHEDULE_KEY = 'charSchedule'
+
+async function charScheduleLoad() {
+  try {
+    const rec = await db.config.get(CHAR_SCHEDULE_KEY)
+    const v = rec && rec.value
+    return (v && Array.isArray(v.events)) ? v : { events: [] }
+  } catch (_) { return { events: [] } }
+}
+
+async function charScheduleSave(data) {
+  const cutoff = Date.now() - 3 * 86400000
+  data.events = (data.events || []).filter(e => e && e.endAt > cutoff).slice(-60)
+  try { await db.config.put({ key: CHAR_SCHEDULE_KEY, value: data }) } catch (e) { console.warn('[wechat] 保存角色日程失败', e) }
+}
+
+// upcoming 稍后 / active 进行中 / overdue 已过预计结束但没确认 / done 已结束
+function charEventPhase(ev, now = Date.now()) {
+  if (ev.status === 'done' || ev.status === 'cancelled') return 'done'
+  if (now < ev.startAt) return 'upcoming'
+  if (now < ev.endAt) return 'active'
+  return 'overdue'
+}
+
+async function applyCharScheduleFromReply(chatId, charId, result) {
+  try {
+    if (!result) return
+    const wantsDone = result.eventDone === true
+    const ev = result.event
+    if (!wantsDone && !ev) return
+    const now = Date.now()
+    const data = await charScheduleLoad()
+    let changed = false
+    if (wantsDone) {
+      data.events.forEach(e => {
+        if (String(e.chatId) !== String(chatId)) return
+        const ph = charEventPhase(e, now)
+        if (ph === 'active' || ph === 'overdue') { e.status = 'done'; e.doneAt = now; changed = true }
+      })
+    }
+    if (ev && typeof ev === 'object') {
+      const title = String(ev.title || '').trim().slice(0, 20)
+      const startIn = ev.start_in_minutes == null ? 0 : Number(ev.start_in_minutes)
+      const dur = Number(ev.duration_minutes)
+      if (title && Number.isFinite(startIn) && startIn >= 0 && startIn <= 4320 && Number.isFinite(dur) && dur >= 5 && dur <= 4320) {
+        const startAt = now + Math.round(startIn) * 60000
+        const endAt = startAt + Math.round(dur) * 60000
+        const same = data.events.find(e => String(e.chatId) === String(chatId) && e.title === title &&
+          e.status !== 'done' && e.status !== 'cancelled' && Math.abs(e.startAt - startAt) < 60 * 60000)
+        if (same) { same.startAt = startAt; same.endAt = endAt; same.sourceAt = now; delete same.notifiedAt }
+        else data.events.push({
+          id: 'ce_' + now + '_' + Math.random().toString(36).slice(2, 6),
+          chatId, charId, title, sourceAt: now, startAt, endAt, status: 'active'
+        })
+        changed = true
+      }
+    }
+    if (changed) await charScheduleSave(data)
+  } catch (e) { console.warn('[wechat] 登记角色日程失败', e) }
+}
+
+async function getCharScheduleState(chatId) {
+  const data = await charScheduleLoad()
+  const now = Date.now()
+  const mine = data.events.filter(e => String(e.chatId) === String(chatId))
+  return {
+    data,
+    active: mine.find(e => charEventPhase(e, now) === 'active') || null,
+    overdue: mine.filter(e => charEventPhase(e, now) === 'overdue' && now - e.endAt < 12 * 3600000)
+      .sort((a, b) => b.endAt - a.endAt)[0] || null
+  }
+}
+
+async function getCharScheduleContext(chatId, charName) {
+  try {
+    if (chatId == null) return ''
+    const data = await charScheduleLoad()
+    const now = Date.now()
+    const list = data.events
+      .filter(e => String(e.chatId) === String(chatId) && charEventPhase(e, now) !== 'done' &&
+        e.endAt > now - 12 * 3600000 && e.startAt < now + 48 * 3600000)
+      .sort((a, b) => a.startAt - b.startAt)
+    if (!list.length) return ''
+    const fmt = ts => formatWechatFullDateTime(ts)
+    const span = ms => ms >= 3600000 ? `${(ms / 3600000).toFixed(1).replace(/\.0$/, '')}小时` : `${Math.max(1, Math.round(ms / 60000))}分钟`
+    const lines = list.map(e => {
+      const ph = charEventPhase(e, now)
+      if (ph === 'upcoming') return `- 稍后：${e.title}，${fmt(e.startAt)} 开始，预计 ${fmt(e.endAt)} 结束`
+      if (ph === 'active') return `- 进行中：${e.title}，${fmt(e.startAt)} 开始，预计 ${fmt(e.endAt)} 结束（已进行 ${span(now - e.startAt)}，还剩约 ${span(e.endAt - now)}）`
+      return `- 已过预计结束时间：${e.title}，预计 ${fmt(e.endAt)} 结束，已超过 ${span(now - e.endAt)}，还没有确认结束${e.notifiedAt ? '（已提醒过一次）' : ''}`
+    })
+    return `【${charName || '你'}的日程（来自聊天里你自己说过的安排，必须和聊天内容保持一致）】\n现在：${fmt(now)}\n${lines.join('\n')}\n使用方式：\n- “进行中”的事就是你此刻真实的处境。按这件事的性质决定你能不能看手机、能回多少：比如飞行中、手术、开会时不能或很难回复；通勤、休息间隙可以简短回几句。如果选择回复，要符合处境，不要突然表现得很闲。\n- “已过预计结束时间”的事说明你应该已经忙完了：如果还没跟对方说过，这次就自然地说一声（落地平安、下班了、开完会了），并在 JSON 里写 "event_done": true。\n- 事情有变化（延误、提前结束、改期）以你在聊天里说的为准，并重新登记 event。\n- 不要凭空编造和这份日程矛盾的安排，也不要每句话都提日程。`
+  } catch (e) { return '' }
+}
+
+// 主动回复的“此刻心境”：不是纯随机，而是按上下文信号加权后再抽一个倾向，只作为参考交给模型
+async function buildActiveReplyImpulse(chatId, idleMs) {
+  try {
+    const recent = await db.messages.where('chatId').equals(Number(chatId)).reverse().limit(12).toArray()
+    const text = recent.map(m => String(m.content || '')).join('\n')
+    const count = words => words.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0)
+    const hours = Math.max(0, idleMs / 3600000)
+    const hour = new Date().getHours()
+    const warm = count(['想你', '抱', '亲', '爱你', '贴贴', '宝宝', '乖'])
+    const intimate = count(['床', '摸', '身体', '想要', '做爱', '硬', '湿', '腰', '腿', '吻'])
+    const fight = count(['生气', '别理我', '不想说', '吵架', '分手', '烦死'])
+    const meal = [7, 8, 11, 12, 13, 17, 18, 19].includes(hour)
+    const late = hour >= 23 || hour <= 4
+    const weights = {
+      miss: 1 + Math.min(hours / 1.5, 4) + warm * 0.5 - (fight ? 0.5 : 0),
+      want: 0.4 + intimate * 0.9 + ((late || hour >= 21) ? 0.8 : 0) + (hours >= 3 ? 0.4 : 0) - (fight ? 1 : 0),
+      care: 0.8 + (meal ? 0.8 : 0) + (late ? 0.6 : 0) + (fight ? 1 : 0),
+      share: 1.2 + ((hour >= 9 && hour <= 18) ? 0.6 : 0)
+    }
+    const keys = Object.keys(weights)
+    keys.forEach(k => { weights[k] = Math.max(0.05, weights[k]) })
+    let r = Math.random() * keys.reduce((n, k) => n + weights[k], 0)
+    let pick = keys[0]
+    for (const k of keys) { r -= weights[k]; if (r <= 0) { pick = k; break } }
+    const label = { miss: '想念', want: '想亲近、想要她', care: '惦记她的状态', share: '想分享点什么' }[pick]
+    const guide = {
+      miss: '你此刻心里最强的是想念。直接把想念和爱意说出来：具体想她的哪一点、想起和她在一起时的哪个细节；不要只是问“在干嘛”。',
+      want: '你此刻身体有了反应、想亲近她。按你的人设和你们的关系，坦率说出你想要她、想碰她，具体到你想怎么做、想要什么感觉；不要只发一句很短的话。',
+      care: '你此刻惦记她。要具体到她今天的安排、情绪或你们最近聊到的事；不要只是问“吃了吗”“早点睡”这类模板问候。',
+      share: '你此刻想和她分享你这边刚发生的一件小事，或突然想到的东西；要具体、有画面，别泛泛而谈。'
+    }[pick]
+    const hoursText = hours >= 1 ? `${hours.toFixed(1).replace(/\.0$/, '')} 小时` : `${Math.max(1, Math.round(hours * 60))} 分钟`
+    return `# 【此刻的心境倾向】\n离上次聊天已经过去 ${hoursText}，现在是 ${hour} 点。结合你们最近的对话，你此刻心里更偏向：${label}。\n${guide}\n这只是倾向，不是命令：如果和当前上下文冲突（你正在忙、刚吵过架、对方心情不好、对话刚停在某个话题上），以上下文为准，自行调整。不要在消息里提到“倾向”“判断”这类词。`
+  } catch (e) { return '' }
+}
+
 // 通用：点按钮读一段文字（通话记录用）。同一段文字同一音色在本次打开期间只生成一次
 const _speakOnceCache = new Map()
 let _speakOnceAudio = null
@@ -20227,6 +20488,8 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
   if (ttsTagHintVoice) prompt += ttsTagHintVoice + '\n\n'
   const scheduleCtxVoice = await getScheduleContext()
   if (scheduleCtxVoice) prompt += scheduleCtxVoice + '\n\n'
+  const charSchedVoice = await getCharScheduleContext(chatId, charName)
+  if (charSchedVoice) prompt += charSchedVoice + '\n\n'
 
   prompt += buildCallOutputFormat('voice') + '\n'
 
@@ -20271,6 +20534,8 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
   if (ttsTagHintVideo) prompt += ttsTagHintVideo + '\n\n'
   const scheduleCtxVideo = await getScheduleContext()
   if (scheduleCtxVideo) prompt += scheduleCtxVideo + '\n\n'
+  const charSchedVideo = await getCharScheduleContext(chatId, charName)
+  if (charSchedVideo) prompt += charSchedVideo + '\n\n'
 
   if (_realCameraActive) {
     prompt += buildRealCameraPart(charName, userName) + '\n\n'
@@ -20459,6 +20724,9 @@ function bindCallEvents(page, type) {
   page.addEventListener('pointerdown', retryPendingCallAudioPlayback)
   page.querySelector('#btn-call-hangup').addEventListener('click', () => endCall())
   page.querySelector('#btn-call-minimize')?.addEventListener('click', () => minimizeCall())
+  // 点通话页任意位置（包括点输入框）都先解锁一次音频，这样回车发送后也能自动朗读
+  page.addEventListener('touchend', unlockCallAudioPlayback, { passive: true })
+  page.addEventListener('click', unlockCallAudioPlayback)
 
   // 自动朗读开关（右上角）
   const callContent = page.querySelector('.call-content')
@@ -20765,12 +21033,38 @@ function getCallDurationSeconds() {
 
 // ===== TTS =====
 
+// iPhone 只允许“被触摸解锁过的音频元素”在没有手势时自动播放。回车发送不算触摸，
+// 所以通话里全程复用同一个 Audio 元素：点屏幕时解锁一次，之后每条语音只换 src。
+let _callSharedAudio = null
+const CALL_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+function getCallSharedAudio() {
+  if (!_callSharedAudio) {
+    _callSharedAudio = new Audio()
+    _callSharedAudio.preload = 'auto'
+  }
+  return _callSharedAudio
+}
+
 function unlockCallAudioPlayback() {
   const keepAliveAudio = document.getElementById('keepalive-audio')
-  if (!keepAliveAudio) return
+  if (keepAliveAudio) {
+    try {
+      keepAliveAudio.volume = 0
+      keepAliveAudio.play().catch(() => {})
+    } catch (_) {}
+  }
   try {
-    keepAliveAudio.volume = 0
-    keepAliveAudio.play().catch(() => {})
+    const a = getCallSharedAudio()
+    if (a._callUnlocked || _callAudioBlobUrl) return
+    a.src = CALL_SILENT_WAV
+    const p = a.play()
+    if (p && p.then) {
+      p.then(() => {
+        a._callUnlocked = true
+        if (String(a.src).startsWith('data:audio/wav')) a.pause()
+      }).catch(() => {})
+    }
   } catch (_) {}
 }
 
@@ -20815,14 +21109,16 @@ async function playCallAudioBlob(blobUrl) {
   stopCallAudio()
   _callPendingAudioBlobUrl = null
   _callAudioBlobUrl = blobUrl
-  _callAudioPlayer = new Audio(blobUrl)
-  _callAudioPlayer.addEventListener('ended', () => {
-    _callAudioPlayer = null
+  const sharedAudio = getCallSharedAudio()
+  _callAudioPlayer = sharedAudio
+  sharedAudio.onended = () => {
+    if (_callAudioPlayer === sharedAudio) _callAudioPlayer = null
     if (_callAudioBlobUrl === blobUrl) _callAudioBlobUrl = null
     URL.revokeObjectURL(blobUrl)
-  })
+  }
+  sharedAudio.src = blobUrl
   try {
-    await _callAudioPlayer.play()
+    await sharedAudio.play()
     clearCallAudioPlayRetry()
   } catch (e) {
     console.warn('通话音频播放失败', e.name || e.message || e)
@@ -20878,6 +21174,7 @@ async function tryPlayCallTTS(speechText, requestSeq) {
 function stopCallAudio() {
   clearCallAudioPlayRetry()
   if (_callAudioPlayer) {
+    _callAudioPlayer.onended = null
     _callAudioPlayer.pause()
     _callAudioPlayer = null
   }
@@ -21624,6 +21921,7 @@ window._wechatCallHelpers = {
   getTTSTagHint,
   isTTSTagEnabled,
   getScheduleContext,
+  getCharScheduleContext,
   speakTextOnce,
   blobUrlToDataUrl,
   getTimeOfDay,

@@ -1467,6 +1467,8 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       const helpers0 = window._wechatCallHelpers || {}
       const sched = typeof helpers0.getScheduleContext === 'function' ? await helpers0.getScheduleContext() : ''
       if (sched) scheduleRule = '\n' + sched + '\n'
+      const charSched = typeof helpers0.getCharScheduleContext === 'function' ? await helpers0.getCharScheduleContext(chat.id, charName) : ''
+      if (charSched) scheduleRule += '\n' + charSched + '\n'
     } catch (_) {}
     let ttsTagRule = ''
     try {
