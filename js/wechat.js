@@ -115,6 +115,8 @@ const CHAT_TIME_GAP_MS = 10 * 60 * 1000
 // “重回”版本只在当前页面运行期保留，不写入任何持久化存储。
 const _privateReplyVersions = new Map()
 const _activeReplyTriggeredFingerprints = new Map()
+const _activeReplyFailCount = new Map() // 主动回复连续失败次数（后台失败不弹窗，之前会因此再也不重试）
+const _activeReplyRetryAfter = new Map() // 失败后多久之后才允许重试
 let _wechatActiveReplyMonitorStarted = false
 // 聊天首屏只渲染最近这么多条消息，往上点「加载更早」再补一窗，避免长聊天 DOM 过大致 iOS Safari 内存崩溃
 const WECHAT_RENDER_WINDOW = 60
@@ -5903,6 +5905,7 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       await updateCharacterStatusFromAI(chatId, charId, status)
       await applyCharScheduleFromReply(chatId, charId, _aiResult)
+      _activeReplyFailCount.delete(chatId)
       const lines = splitMessageLines(reply)
       const base = Date.now()
       for (let i = 0; i < lines.length; i++) {
@@ -5982,6 +5985,22 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       else console.warn('[wechat] AI 回复失败:', e)
       if (e.diagnostic) console.warn('[wechat] AI 回复诊断:', e.diagnostic)
+      // 主动回复失败：10 分钟后重试，最多连续 3 次（以前失败后会一直等到下一条新消息才可能再触发）
+      if (options.idleTriggerMode) {
+        const fails = (_activeReplyFailCount.get(chatId) || 0) + 1
+        _activeReplyFailCount.set(chatId, fails)
+        if (fails < 3) {
+          _activeReplyTriggeredFingerprints.delete(chatId)
+          _activeReplyRetryAfter.set(chatId, Date.now() + 10 * 60 * 1000)
+        }
+        if (options.scheduleDueId) {
+          try {
+            const d = await charScheduleLoad()
+            const ev = d.events.find(x => x.id === options.scheduleDueId)
+            if (ev) { delete ev.notifiedAt; await charScheduleSave(d) }
+          } catch (_) {}
+        }
+      }
     } finally {
       _pendingAIReplies.delete(key)
       applyTypingUI('chat', chatId, false)
@@ -6379,6 +6398,7 @@ async function runWechatActiveReplyCheck() {
       if (!cfg.enabled) continue
       if (isNowInQuietHours(cfg)) continue
       if (isAIReplyPending('chat', chat.id)) continue
+      if ((_activeReplyRetryAfter.get(chat.id) || 0) > Date.now()) continue
       if (window.isCallActiveWith?.(chat.charId)) continue
       const char = await db.characters.get(chat.charId)
       if (!char || char.type === 'online_friend') continue
@@ -6415,7 +6435,8 @@ async function runWechatActiveReplyCheck() {
       startPrivateAIReply(chat.id, chat.charId, {
         idleTriggerMode: triggerMode,
         idleMinutes: Math.max(1, Math.floor(idleMs / 60000)),
-        impulseHint
+        impulseHint,
+        scheduleDueId: scheduleDue ? scheduleDue.id : ''
       })
     } catch (err) {
       console.warn('[wechat] 主动回复巡检失败:', err)
@@ -6430,6 +6451,12 @@ function ensureWechatActiveReplyMonitorStarted() {
   setInterval(() => {
     runWechatActiveReplyCheck().catch(err => console.warn('[wechat] 主动回复巡检异常:', err))
   }, CHAT_ACTIVE_REPLY_CHECK_MS)
+  // 从后台/锁屏回到前台时立刻巡检一次，不用等下一个 2 分钟
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      runWechatActiveReplyCheck().catch(err => console.warn('[wechat] 主动回复巡检异常:', err))
+    }
+  })
 }
 
 async function getChatHistoryLimit(chatId) {
@@ -6673,6 +6700,14 @@ function buildPromptContextEstimateSummary(charCounts) {
 }
 
 function buildPromptContextEstimateHTML(summary) {
+  if (!summary) {
+    return `
+    <div class="cs-section cs-token-estimate">
+      <div class="cs-section-label">Token 预估</div>
+      <div class="cs-token-estimate-note">计算中…</div>
+    </div>
+  `
+  }
   const stats = buildPromptContextEstimateSummary(summary)
   const rows = [
     ['fa-brands fa-weixin', '微信聊天记录', stats.wechatChars, 'data-icon-wechat'],
@@ -9053,6 +9088,9 @@ async function showMsgMenu(anchorEl, msgId, context) {
 }
 
 // 定位菜单
+// iPhone 弹出输入法时，可见区域(visualViewport)会和整页(layout viewport)错开：
+// 以前按整页高度算位置，菜单会跑到可见区域之外，要收起输入法再上滑才能看到。
+// 现在把菜单限制在“当前真正看得到的区域”里。
 function positionMsgMenu(menu, bubbleEl) {
   const rect = bubbleEl.getBoundingClientRect()
   const gap = 8
@@ -9060,15 +9098,20 @@ function positionMsgMenu(menu, bubbleEl) {
   const menuRect = menu.getBoundingClientRect()
   const menuWidth = menuRect.width
   const menuHeight = menuRect.height
-  const viewportWidth = window.innerWidth
-  const viewportHeight = window.innerHeight
-  const maxLeft = Math.max(edge, viewportWidth - menuWidth - edge)
-  const left = Math.min(Math.max(rect.left, edge), maxLeft)
+  const vv = window.visualViewport
+  const vTop = vv ? vv.offsetTop : 0
+  const vLeft = vv ? vv.offsetLeft : 0
+  const vWidth = vv ? vv.width : window.innerWidth
+  const vHeight = vv ? vv.height : window.innerHeight
+  const minLeft = vLeft + edge
+  const maxLeft = Math.max(minLeft, vLeft + vWidth - menuWidth - edge)
+  const left = Math.min(Math.max(rect.left, minLeft), maxLeft)
+  const minTop = vTop + edge
+  const maxTop = Math.max(minTop, vTop + vHeight - menuHeight - edge)
   const topAbove = rect.top - menuHeight - gap
   const topBelow = rect.bottom + gap
-  const top = topAbove >= edge
-    ? topAbove
-    : Math.min(topBelow, Math.max(edge, viewportHeight - menuHeight - edge))
+  let top = topAbove >= minTop ? topAbove : topBelow
+  top = Math.min(Math.max(top, minTop), maxTop)
   menu.style.top = top + 'px'
   menu.style.left = left + 'px'
 }
@@ -15970,68 +16013,91 @@ async function showStartChatModal(page) {
 
 
 // ===== 聊天设置页 =====
+let _chatSettingsOpening = false
 async function openChatSettings(chatId, charId, chatPage) {
-  const char = await window.getCharacter(charId)
-  const profile = await getWechatProfile(_wechatUid, charId)
-  const memory = await db.config.get(`chatMemory_${chatId}`)
-  const memoryValue = typeof memory?.value === 'object' ? memory.value.historyLimit : memory?.value
-  const historyLimit = clampWechatMemoryLimit(memoryValue)
-  const settingsPage = document.createElement('div')
-  settingsPage.id = 'chat-settings-page'
-  settingsPage.className = 'full-page'
-  settingsPage.dataset.charName = getWechatDisplayName(char)
-  const mounted = await db.config.get(`chatLore_${chatId}`)
-  const lorebooksRaw = await db.config.get('lorebooks')
-  const lorebooks = lorebooksRaw?.value || []
-  const mountedIds = normalizeChatLoreMountIds(mounted?.value, lorebooks, charId)
-  if (!areChatLoreMountIdsEqual(mounted?.value, mountedIds)) {
-    await db.config.put({ key: `chatLore_${chatId}`, value: mountedIds })
+  // 防止在页面还没出来时连点，打开多个设置页叠在一起造成闪烁
+  if (_chatSettingsOpening) return
+  _chatSettingsOpening = true
+  try {
+    // 这些读取互不依赖，一起并行读，比一个一个等快得多
+    const [
+      char, profile, memory, mounted, lorebooksRaw, appearance, stickerCats, mountedStickerIds,
+      tzStored, statusDisplay, activeReplySettings, timeSettings, bilingualSettings, imageGenSettings,
+      stickerImageInputEnabled, thoughtTemplateStored, thoughtPresets, chatBeautyStored, chatBeautyPresets,
+      longMemorySettings, longMemoryCount, voiceIdStored, msgNotify
+    ] = await Promise.all([
+      window.getCharacter(charId),
+      getWechatProfile(_wechatUid, charId),
+      db.config.get(`chatMemory_${chatId}`),
+      db.config.get(`chatLore_${chatId}`),
+      db.config.get('lorebooks'),
+      db.config.get(`chatAppearance_${chatId}`),
+      getAllStickerCategories(),
+      getMountedStickerCatIds(chatId),
+      db.config.get(`chatTimezone_${chatId}`),
+      getChatStatusDisplayConfig(chatId),
+      getChatActiveReplySettings(chatId),
+      getChatTimeSettings(chatId),
+      getChatBilingualSettings(chatId),
+      getChatImageGenSettings(chatId),
+      getChatStickerImageInputEnabled(chatId),
+      db.config.get(`chatThoughtTemplate_${chatId}`),
+      getThoughtPresets(),
+      db.config.get(`chatBeauty_${chatId}`),
+      getChatBeautyPresets(),
+      window.WanWanMemory?.getSettings
+        ? window.WanWanMemory.getSettings(chatId)
+        : Promise.resolve({ enabled: true, summarizeEvery: 30, injectLimit: 12, embeddingEnabled: false, decayStrength: 'medium' }),
+      db.memories
+        ? db.memories.where('chatId').equals(chatId).filter(m => m.ownerUid === _wechatUid && m.charId === charId).count()
+        : Promise.resolve(0),
+      db.config.get(`chatVoiceId_${chatId}`),
+      getChatMsgNotifySettings(chatId)
+    ])
+    const memoryValue = typeof memory?.value === 'object' ? memory.value.historyLimit : memory?.value
+    const historyLimit = clampWechatMemoryLimit(memoryValue)
+    const settingsPage = document.createElement('div')
+    settingsPage.id = 'chat-settings-page'
+    settingsPage.className = 'full-page'
+    settingsPage.dataset.charName = getWechatDisplayName(char)
+    const lorebooks = lorebooksRaw?.value || []
+    const mountedIds = normalizeChatLoreMountIds(mounted?.value, lorebooks, charId)
+    if (!areChatLoreMountIdsEqual(mounted?.value, mountedIds)) {
+      await db.config.put({ key: `chatLore_${chatId}`, value: mountedIds })
+    }
+    const appearanceValue = normalizeChatAppearance(appearance?.value)
+    // 同时拉取每个分组下表情数量，便于在设置页显示
+    const counts = await Promise.all(stickerCats.map(c => db.stickers.where('categoryId').equals(c.id).count()))
+    const stickerCounts = {}
+    stickerCats.forEach((c, i) => { stickerCounts[c.id] = counts[i] })
+    const tzConfig = tzStored?.value || {}
+    const thoughtTemplateRaw = thoughtTemplateStored ? thoughtTemplateStored.value || {} : { enabled: true }
+    const chatBeautyRaw = chatBeautyStored?.value || {}
+    const voiceId = voiceIdStored?.value || ''
+    settingsPage.innerHTML = buildChatSettingsHTML(
+      char, profile, historyLimit,
+      lorebooks, mountedIds, appearanceValue,
+      stickerCats, mountedStickerIds, stickerCounts, tzConfig, statusDisplay, timeSettings, thoughtTemplateRaw, thoughtPresets,
+      activeReplySettings,
+      bilingualSettings, imageGenSettings, stickerImageInputEnabled,
+      chatBeautyRaw, chatBeautyPresets,
+      longMemorySettings, longMemoryCount,
+      null, // Token 预估最耗时（要把整段聊天记录、记忆、世界书都拼一遍），页面打开之后再补
+      voiceId, msgNotify
+    )
+    window.openPage(settingsPage)
+    bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char)
+    estimateWechatPromptContext(chatId, charId, _wechatUid, historyLimit).then(estimate => {
+      const slot = settingsPage.querySelector('.cs-token-estimate')
+      if (slot && settingsPage.isConnected) slot.outerHTML = buildPromptContextEstimateHTML(estimate)
+    }).catch(err => {
+      console.warn('[wechat] Token 预估失败', err)
+      const note = settingsPage.querySelector('.cs-token-estimate .cs-token-estimate-note')
+      if (note) note.textContent = '预估失败，不影响使用。'
+    })
+  } finally {
+    _chatSettingsOpening = false
   }
-  const appearance = await db.config.get(`chatAppearance_${chatId}`)
-  const appearanceValue = normalizeChatAppearance(appearance?.value)
-  const stickerCats = await getAllStickerCategories()
-  const mountedStickerIds = await getMountedStickerCatIds(chatId)
-  // 同时拉取每个分组下表情数量，便于在设置页显示
-  const stickerCounts = {}
-  for (const c of stickerCats) {
-    stickerCounts[c.id] = await db.stickers.where('categoryId').equals(c.id).count()
-  }
-  const tzStored = await db.config.get(`chatTimezone_${chatId}`)
-  const tzConfig = tzStored?.value || {}
-  const statusDisplay = await getChatStatusDisplayConfig(chatId)
-  const activeReplySettings = await getChatActiveReplySettings(chatId)
-  const timeSettings = await getChatTimeSettings(chatId)
-  const bilingualSettings = await getChatBilingualSettings(chatId)
-  const imageGenSettings = await getChatImageGenSettings(chatId)
-  const stickerImageInputEnabled = await getChatStickerImageInputEnabled(chatId)
-  const thoughtTemplateStored = await db.config.get(`chatThoughtTemplate_${chatId}`)
-  const thoughtTemplateRaw = thoughtTemplateStored ? thoughtTemplateStored.value || {} : { enabled: true }
-  const thoughtPresets = await getThoughtPresets()
-  const chatBeautyRaw = (await db.config.get(`chatBeauty_${chatId}`))?.value || {}
-  const chatBeautyPresets = await getChatBeautyPresets()
-  const longMemorySettings = window.WanWanMemory?.getSettings
-    ? await window.WanWanMemory.getSettings(chatId)
-    : { enabled: true, summarizeEvery: 30, injectLimit: 12, embeddingEnabled: false, decayStrength: 'medium' }
-  const longMemoryCount = db.memories
-    ? await db.memories.where('chatId').equals(chatId).filter(m => m.ownerUid === _wechatUid && m.charId === charId).count()
-    : 0
-  const promptEstimate = await estimateWechatPromptContext(chatId, charId, _wechatUid, historyLimit)
-  const voiceIdStored = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdStored?.value || ''
-  const msgNotify = await getChatMsgNotifySettings(chatId)
-  settingsPage.innerHTML = buildChatSettingsHTML(
-    char, profile, historyLimit,
-    lorebooks, mountedIds, appearanceValue,
-    stickerCats, mountedStickerIds, stickerCounts, tzConfig, statusDisplay, timeSettings, thoughtTemplateRaw, thoughtPresets,
-    activeReplySettings,
-    bilingualSettings, imageGenSettings, stickerImageInputEnabled,
-    chatBeautyRaw, chatBeautyPresets,
-    longMemorySettings, longMemoryCount,
-    promptEstimate,
-    voiceId, msgNotify
-  )
-  window.openPage(settingsPage)
-  bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char)
 }
 
 // 聊天设置HTML
