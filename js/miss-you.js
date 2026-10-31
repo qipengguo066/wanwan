@@ -694,11 +694,13 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       sendPending = true
       sendButton.disabled = true
       try {
+        const isFirstMessage = !(await getOfflineMessages(ownerUid, chat.id, chat.charId, mode)).length
         await addOfflineMessage(ownerUid, chat.id, chat.charId, mode, 'user', text)
         await refreshOfflineChat(page)
         if (input.value === draft) input.value = ''
         syncMissInputHeight(input, true)
         startOfflineAIReply(page)
+        if (isFirstMessage) promptSuspendActiveReply(page, chat)
         return true
       } catch (error) {
         console.error('[miss-you] 消息发送失败:', error)
@@ -867,12 +869,60 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       } else {
         window.toast('已结束此次见面')
       }
+      // 见面结束了：询问是否把微信的主动回复恢复回来
+      promptRestoreActiveReply(page, state.chat)
     } finally {
       _missSummaryPending.delete(key)
       if (endButton) {
         endButton.disabled = false
         endButton.textContent = '结束'
       }
+    }
+  }
+
+  // ===== 见面期间和微信主动回复联动 =====
+  // 见面开始（发出第一条消息）：询问是否先关闭这个聊天的主动回复，避免角色在微信里提前说出“分别之后”的内容。
+  // 见面结束：询问是否恢复。只有用户在开始时点了“关闭”，结束时才会问。
+  async function promptSuspendActiveReply(page, chat) {
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.getChatActiveReplySettings !== 'function' || typeof helpers.setChatActiveReplyEnabled !== 'function') return
+      const cfg = await helpers.getChatActiveReplySettings(chat.id)
+      if (!cfg.enabled) return
+      const choice = await showMeetChoiceModal({
+        title: '见面期间先关闭主动回复？',
+        message: '这次见面还没结束，微信里的主动回复可能会让角色提前说出“分别之后”的内容。要先把这个聊天的主动回复关掉吗？见面结束时会再问你是否恢复。',
+        buttons: [{ value: 'off', label: '关闭主动回复', primary: true }]
+      }, page)
+      if (choice !== 'off') return
+      await helpers.setChatActiveReplyEnabled(chat.id, false)
+      await db.config.put({ key: `missActiveReplyBackup_${chat.id}`, value: { wasEnabled: true, at: Date.now() } })
+      window.toast?.('已关闭主动回复，见面结束时会询问是否恢复')
+    } catch (e) {
+      console.warn('[miss-you] 关闭主动回复失败:', e)
+    }
+  }
+
+  async function promptRestoreActiveReply(page, chat) {
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.getChatActiveReplySettings !== 'function' || typeof helpers.setChatActiveReplyEnabled !== 'function') return
+      const key = `missActiveReplyBackup_${chat.id}`
+      const backup = (await db.config.get(key))?.value
+      if (!backup || !backup.wasEnabled) return
+      const cfg = await helpers.getChatActiveReplySettings(chat.id)
+      if (cfg.enabled) { await db.config.delete(key); return } // 期间已经手动打开了
+      const choice = await showMeetChoiceModal({
+        title: '恢复主动回复？',
+        message: '这次见面已经结束，要把这个聊天的主动回复重新打开吗？',
+        buttons: [{ value: 'on', label: '恢复开启', primary: true }]
+      }, page)
+      await db.config.delete(key) // 只问这一次
+      if (choice !== 'on') return
+      await helpers.setChatActiveReplyEnabled(chat.id, true)
+      window.toast?.('已恢复主动回复')
+    } catch (e) {
+      console.warn('[miss-you] 恢复主动回复失败:', e)
     }
   }
 
@@ -990,6 +1040,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   let _missSpeechBtn = null
   let _missAutoSpeak = true // 角色回复后是否自动朗读（默认开，记在 db.config.missAutoSpeak）
   let _missNoVoiceToasted = false
+  let _missAutoPendingBtn = null // 自动朗读：正在生成、等生成好再覆盖上一段的那个按钮
   let _missSharedAudio = null // 全程复用同一个 Audio 元素，iOS 上解锁一次后自动播放才不会被拦
 
   function getMissAudio() {
@@ -999,13 +1050,23 @@ ${MISS_BEAUTY_CLASS_TEXT}`
 
   function unlockMissAudio() {
     const a = getMissAudio()
-    if (a._missUnlocked) return
-    a._missUnlocked = true
+    // 已经解锁过、正在朗读/生成、或上一次解锁还没结果时，什么都不做。
+    // （以前解锁失败后每次触摸都会把静音文件塞进去，把正在播的朗读顶掉，所以滑动/点输入框会中断）
+    if (a._missUnlocked || a._missUnlocking || _missSpeechAudio || _missAutoPendingBtn) return
+    a._missUnlocking = true
     try {
       a.src = MISS_SILENT_WAV
       const p = a.play()
-      if (p && p.catch) p.catch(() => { a._missUnlocked = false })
-    } catch (_) { a._missUnlocked = false }
+      if (p && p.then) {
+        p.then(() => {
+          a._missUnlocked = true
+          a._missUnlocking = false
+          if (!_missSpeechAudio && String(a.src).startsWith('data:audio/wav')) { try { a.pause() } catch (_) {} }
+        }).catch(() => { a._missUnlocking = false })
+      } else {
+        a._missUnlocking = false
+      }
+    } catch (_) { a._missUnlocking = false }
   }
 
   function extractOfflineSpeech(text) {
@@ -1021,6 +1082,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   function stopMissSpeech() {
+    _missAutoPendingBtn = null
     if (_missSpeechAudio) {
       try { _missSpeechAudio.pause() } catch (_) {}
       _missSpeechAudio.onended = null
@@ -1034,24 +1096,37 @@ ${MISS_BEAUTY_CLASS_TEXT}`
 
   async function speakOfflineEntry(page, msgId, btn, opts = {}) {
     const auto = !!opts.auto
-    if (_missSpeechBtn === btn) { stopMissSpeech(); return }
-    stopMissSpeech()
+    if (!auto && _missSpeechBtn === btn) { stopMissSpeech(); return }
+    if (auto && _missSpeechBtn === btn) return
     const audio = getMissAudio()
     if (!auto) {
-      // 手动点击：在手势里先“解锁”音频，iOS 上异步生成完再播放才不会被拦
+      // 手动点击：先停掉当前的，并在手势里“解锁”音频，iOS 上异步生成完再播放才不会被拦
+      stopMissSpeech()
       audio.src = MISS_SILENT_WAV
       audio.play().catch(() => {})
+      _missSpeechAudio = audio
+      _missSpeechBtn = btn
+      btn.classList.add('is-loading')
+    } else {
+      // 自动朗读：上一段继续播放，新的这段生成好之后再覆盖它（不会因为生成而打断上一段）
+      _missAutoPendingBtn = btn
+      btn.classList.add('is-loading')
     }
-    _missSpeechAudio = audio
-    _missSpeechBtn = btn
-    btn.classList.add('is-loading')
+    const giveUp = () => {
+      if (auto) {
+        btn.classList.remove('is-loading')
+        if (_missAutoPendingBtn === btn) _missAutoPendingBtn = null
+      } else {
+        stopMissSpeech()
+      }
+    }
     try {
       const row = await db.offlineChats.get(msgId)
       if (!row) throw new Error('找不到这条记录')
       const settings = page?._missState?.settings || await getOfflineSettings(row.ownerUid, row.chatId, row.mode)
       const parsed = parseMissStatus(row.content || '', settings)
       const text = extractOfflineSpeech(stripOfflineLabel(parsed.status ? parsed.text : row.content))
-      if (!text) { if (!auto) window.toast?.('这条里没有对白可以朗读'); stopMissSpeech(); return }
+      if (!text) { if (!auto) window.toast?.('这条里没有对白可以朗读'); giveUp(); return }
       const helpers = window._wechatCallHelpers || {}
       if (typeof helpers.callTTS !== 'function' || typeof helpers.getChatVoiceId !== 'function') {
         throw new Error('语音功能未加载')
@@ -1060,7 +1135,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       if (!voiceId) {
         if (!auto || !_missNoVoiceToasted) window.toast?.('这个角色还没设置音色 ID（微信聊天设置里填）')
         if (auto) _missNoVoiceToasted = true
-        stopMissSpeech()
+        giveUp()
         return
       }
       const key = voiceId + '|' + text
@@ -1074,14 +1149,24 @@ ${MISS_BEAUTY_CLASS_TEXT}`
           _missSpeechCache.delete(oldest)
         }
       }
-      if (_missSpeechBtn !== btn) return // 期间被点了停止或换了别条
+      if (auto) {
+        // 期间被更新的自动朗读、手动停止或关闭自动朗读取代了：放弃这一段
+        if (_missAutoPendingBtn !== btn) { btn.classList.remove('is-loading'); return }
+        _missAutoPendingBtn = null
+        stopMissSpeech() // 上一段到这里才被换掉
+        _missSpeechAudio = audio
+        _missSpeechBtn = btn
+      } else if (_missSpeechBtn !== btn) {
+        return // 期间被点了停止或换了别条
+      }
       btn.classList.remove('is-loading')
       btn.classList.add('is-playing')
       audio.src = url
       audio.onended = () => { if (_missSpeechBtn === btn) stopMissSpeech() }
       await audio.play()
     } catch (e) {
-      stopMissSpeech()
+      if (_missSpeechBtn === btn) stopMissSpeech()
+      else giveUp()
       if (auto) {
         // 自动朗读失败不弹大窗，提示一下即可，可以点小喇叭重试
         console.warn('[miss-you] 自动朗读失败:', e)
