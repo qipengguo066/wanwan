@@ -4895,6 +4895,14 @@ function buildWechatRenderTimeline(messages, traces) {
 async function loadChatMessages(page, chatId, options = {}) {
   const container = page.querySelector('#chat-messages')
   const charId = parseInt(page.dataset.charId)
+  // 搜索跳转：以目标消息为中心渲染一小段历史（jumpWindow），此时列表不是「最新」状态
+  const isJumpWindow = !!(options.jumpWindow && Array.isArray(options.pageMessages))
+  if (container?._wechatJumpMode && !isJumpWindow) {
+    // 正处于搜索跳转的历史位置时，任何普通刷新（发消息、收到回复等）都先回到最新消息再正常渲染
+    container._wechatJumpMode = false
+    container.querySelector('.chat-jump-latest')?.remove()
+    options = { ...options, scrollToBottom: true }
+  }
   const [char, timeSettings, bilingualSettings, msgs] = await Promise.all([
     getWechatDisplayCharacter(charId),
     getChatTimeSettings(chatId),
@@ -4920,6 +4928,10 @@ async function loadChatMessages(page, chatId, options = {}) {
     scrollToBottom: !!options.scrollToBottom,
     initialScrollToBottom: !!options.initialScrollToBottom
   })
+  if (isJumpWindow) {
+    container._wechatJumpMode = true
+    showChatJumpLatestBar(page, container)
+  }
   if (isAIReplyPending('chat', chatId)) applyTypingUI('chat', chatId, true)
 }
 
@@ -5125,6 +5137,269 @@ async function renderMessages(container, msgs, charId, charName, stickerMap, tim
   const scrollRequestedAt = shouldScrollToBottom ? createChatAutoScrollRequest(container) : null
   watchMessageMediaForBottom(container, container, shouldScrollToBottom, scrollRequestedAt)
   if (scrollRequestedAt) scrollChatToBottom(container, { requestedAt: scrollRequestedAt })
+}
+
+// ===== 聊天内搜索：查找聊天记录（按内容 / 按日期），点结果跳到对应消息并高亮 =====
+const CHAT_SEARCH_PAGE_SIZE = 50
+const CHAT_JUMP_BEFORE = 30
+const CHAT_JUMP_AFTER = 40
+// 这些类型 getMsgActionText 能给出可读文字；其余类型（红包、通话记录等）用摘要文字
+const CHAT_SEARCH_TEXT_TYPES = new Set(['text', 'quote', 'voice', 'photo', 'real-photo', 'sticker', 'transfer-recv', 'location', 'link', 'shop-approval'])
+
+function formatChatSearchTime(ts) {
+  const d = new Date(Number(ts) || 0)
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function formatChatSearchDateValue(ts) {
+  const d = new Date(Number(ts) || 0)
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+// 读取一个聊天的全部消息，只保留「可搜索的轻量文字索引」，不把大图等内容留在内存里
+async function buildChatSearchIndex(chatId, charName) {
+  const list = []
+  const push = m => {
+    if (!m || typeof m.content !== 'string' || !m.content) return
+    let type = ''
+    try { type = parseMsgType(m.content, charName).type } catch (e) { return }
+    if (type === 'status-update' || type === 'recall' || type === 'system-note' || type === 'transfer-resp') return
+    let text = ''
+    try {
+      text = CHAT_SEARCH_TEXT_TYPES.has(type)
+        ? getMsgActionText(m, charName)
+        : getWechatMessageDisplayPreview(m, charName)
+    } catch (e) { return }
+    text = String(text || '').trim()
+    if (!text) return
+    let lower = text.toLowerCase()
+    if (lower.length !== text.length) lower = text
+    list.push({ id: m.id, at: Number(m.createdAt) || 0, self: m.role === 'user', text, lower })
+  }
+  const run = op => window.runWanWanDBRead ? window.runWanWanDBRead(op) : op()
+  await run(async () => {
+    list.length = 0
+    try {
+      await db.messages.where('[chatId+createdAt]').between([chatId, Dexie.minKey], [chatId, Dexie.maxKey]).each(push)
+    } catch (e) {
+      list.length = 0
+      await db.messages.where('chatId').equals(chatId).each(push)
+    }
+  })
+  list.sort((a, b) => a.at - b.at || a.id - b.id)
+  return list
+}
+
+function buildChatSearchSnippet(text, lower, kw) {
+  const flat = text.replace(/[\r\n\t]/g, ' ')
+  const idx = lower.indexOf(kw)
+  if (idx < 0) return wcEscHtml(flat.slice(0, 80))
+  const start = Math.max(0, idx - 18)
+  const end = Math.min(flat.length, idx + kw.length + 60)
+  return (start > 0 ? '…' : '')
+    + wcEscHtml(flat.slice(start, idx))
+    + '<mark>' + wcEscHtml(flat.slice(idx, idx + kw.length)) + '</mark>'
+    + wcEscHtml(flat.slice(idx + kw.length, end))
+    + (end < flat.length ? '…' : '')
+}
+
+async function openChatHistorySearch(chatPage, chatId, charId, settingsPage) {
+  if (document.getElementById('chat-search-page')) return
+  const page = document.createElement('div')
+  page.id = 'chat-search-page'
+  page.className = 'full-page chat-search-page'
+  page.innerHTML = `
+    <div class="page-header">
+      <button class="header-back" id="cse-back" type="button"><i class="fa fa-angle-left"></i></button>
+      <span class="header-title">查找聊天记录</span>
+    </div>
+    <div class="cse-bar">
+      <div class="cse-field">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <input id="cse-input" type="search" placeholder="搜索" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+    </div>
+    <label class="cse-date-row">
+      <span><i class="fa-regular fa-calendar"></i>按日期查找</span>
+      <input id="cse-date" type="date">
+    </label>
+    <div class="cse-list" id="cse-list"><div class="cse-hint">正在读取聊天记录…</div></div>
+  `
+  window.openPage(page)
+  const listEl = page.querySelector('#cse-list')
+  const inputEl = page.querySelector('#cse-input')
+  const dateEl = page.querySelector('#cse-date')
+  page.querySelector('#cse-back').addEventListener('click', () => window.closePage('chat-search-page'))
+
+  let index = []
+  let ready = false
+  let matches = []
+  let shown = 0
+  let kw = ''
+  let charName = ''
+  const selfName = (typeof _wechatUser !== 'undefined' && (_wechatUser?.nick || _wechatUser?.name)) || '我'
+
+  const showHint = text => { listEl.innerHTML = `<div class="cse-hint">${wcEscHtml(text)}</div>` }
+  const idleHint = () => showHint(index.length
+    ? `输入关键词搜索这个聊天里的 ${index.length} 条消息，或选择日期直接跳转`
+    : '这个聊天还没有可搜索的消息')
+
+  const renderMore = () => {
+    const slice = matches.slice(shown, shown + CHAT_SEARCH_PAGE_SIZE)
+    shown += slice.length
+    listEl.querySelector('.cse-more')?.remove()
+    const html = slice.map(r => `
+      <button class="cse-item" type="button" data-id="${r.id}">
+        <div class="cse-item-top">
+          <span class="cse-item-name">${wcEscHtml(r.self ? selfName : charName)}</span>
+          <span class="cse-item-time">${formatChatSearchTime(r.at)}</span>
+        </div>
+        <div class="cse-item-text">${buildChatSearchSnippet(r.text, r.lower, kw)}</div>
+      </button>`).join('')
+    listEl.insertAdjacentHTML('beforeend', html)
+    if (shown < matches.length) {
+      listEl.insertAdjacentHTML('beforeend', `<button class="cse-more" type="button">显示更多（还有 ${matches.length - shown} 条）</button>`)
+    }
+  }
+
+  const runSearch = () => {
+    kw = inputEl.value.trim().toLowerCase()
+    if (!ready) return
+    if (!kw) { matches = []; shown = 0; idleHint(); return }
+    matches = []
+    for (let i = index.length - 1; i >= 0; i--) {
+      if (index[i].lower.indexOf(kw) >= 0) matches.push(index[i])
+    }
+    shown = 0
+    if (!matches.length) { showHint('没有找到相关的聊天记录'); return }
+    listEl.innerHTML = `<div class="cse-count">共找到 ${matches.length} 条相关消息</div>`
+    renderMore()
+    listEl.scrollTop = 0
+  }
+
+  let timer = null
+  let composing = false
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(runSearch, 180) }
+  inputEl.addEventListener('compositionstart', () => { composing = true })
+  inputEl.addEventListener('compositionend', () => { composing = false; schedule() })
+  inputEl.addEventListener('input', () => { if (!composing) schedule() })
+  inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); inputEl.blur(); runSearch() } })
+
+  const goTo = id => jumpToChatMessage(chatPage, chatId, id)
+  listEl.addEventListener('click', e => {
+    const more = e.target.closest('.cse-more')
+    if (more) { renderMore(); return }
+    const item = e.target.closest('.cse-item')
+    if (item) goTo(parseInt(item.dataset.id, 10))
+  })
+  dateEl.addEventListener('change', () => {
+    if (!ready || !dateEl.value) return
+    const [y, mo, d] = dateEl.value.split('-').map(Number)
+    const start = new Date(y, mo - 1, d).getTime()
+    const end = new Date(y, mo - 1, d + 1).getTime()
+    const hit = index.find(r => r.at >= start && r.at < end)
+    if (!hit) { window.toast?.('这一天没有聊天记录'); return }
+    goTo(hit.id)
+  })
+
+  try {
+    const char = await getWechatDisplayCharacter(charId)
+    charName = getWechatDisplayName(char)
+    index = await buildChatSearchIndex(chatId, charName)
+  } catch (e) {
+    console.error('[chat-search] 读取聊天记录失败', e)
+    showHint('读取聊天记录失败，请退出再试一次')
+    return
+  }
+  ready = true
+  if (index.length) {
+    dateEl.min = formatChatSearchDateValue(index[0].at)
+    dateEl.max = formatChatSearchDateValue(index[index.length - 1].at)
+  }
+  if (inputEl.value.trim()) runSearch()
+  else idleHint()
+}
+
+function centerChatRow(container, row) {
+  const cs = getComputedStyle(container)
+  const top = parseFloat(cs.paddingTop) || 0
+  const bottom = parseFloat(cs.paddingBottom) || 0
+  const visibleH = container.clientHeight - top - bottom
+  const cr = container.getBoundingClientRect()
+  const rr = row.getBoundingClientRect()
+  const target = rr.height >= visibleH ? top : top + (visibleH - rr.height) / 2
+  container.scrollTop += (rr.top - cr.top) - target
+}
+
+function flashChatRow(row) {
+  row.classList.remove('msg-jump-flash')
+  void row.offsetWidth
+  row.classList.add('msg-jump-flash')
+  setTimeout(() => row.classList.remove('msg-jump-flash'), 2400)
+}
+
+function showChatJumpLatestBar(chatPage, container) {
+  container.querySelector('.chat-jump-latest')?.remove()
+  const wrap = document.createElement('div')
+  wrap.className = 'chat-jump-latest'
+  wrap.innerHTML = '<button type="button"><i class="fa-solid fa-angles-down"></i><span>回到最新消息</span></button>'
+  wrap.querySelector('button').addEventListener('click', () => {
+    refreshChat(chatPage, { scrollToBottom: true })
+  })
+  container.appendChild(wrap)
+}
+
+// 跳到某条消息并高亮：目标在当前列表里就直接滚过去；不在就以它为中心重新渲染一小段历史
+async function jumpToChatMessage(chatPage, chatId, msgId) {
+  const container = chatPage?.querySelector('#chat-messages')
+  if (!container || !chatPage.isConnected || !msgId) return
+  const rowSelector = `.msg-row[data-id="${msgId}"]`
+  window.closePage('chat-search-page')
+  window.closePage('chat-settings-page')
+  let row = container.querySelector(rowSelector)
+  if (!row) {
+    try {
+      const target = await db.messages.get(msgId)
+      if (!target) { window.toast?.('这条消息已经不存在了'); return }
+      const [before, after] = await Promise.all([
+        getChatMessagesBefore(chatId, target, CHAT_JUMP_BEFORE),
+        db.messages.where('[chatId+createdAt]')
+          .between([chatId, target.createdAt], [chatId, Dexie.maxKey], true, true)
+          .limit(CHAT_JUMP_AFTER).toArray()
+      ])
+      const map = new Map()
+      before.concat(after).forEach(m => map.set(m.id, m))
+      map.set(target.id, target)
+      const pageMessages = [...map.values()].sort((a, b) =>
+        (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0) || a.id - b.id)
+      const load = () => loadChatMessages(chatPage, chatId, { pageMessages, jumpWindow: true })
+      await (window.runWanWanDBRead ? window.runWanWanDBRead(load) : load())
+    } catch (e) {
+      console.error('[chat-search] 跳转失败', e)
+      window.toast?.('跳转失败，请再试一次')
+      return
+    }
+    row = container.querySelector(rowSelector)
+  }
+  if (!row) { window.toast?.('这条消息没有显示在聊天里'); return }
+  let touched = false
+  const markTouched = () => { touched = true }
+  container.addEventListener('touchstart', markTouched, { once: true, passive: true })
+  container.addEventListener('wheel', markTouched, { once: true, passive: true })
+  centerChatRow(container, row)
+  // 页面关闭动画期间位置可能还会变，图片加载后高度也会变：稍后再校正一次并高亮
+  setTimeout(() => {
+    const r = container.querySelector(rowSelector)
+    if (!r) return
+    if (!touched) centerChatRow(container, r)
+    flashChatRow(r)
+  }, 380)
+  setTimeout(() => {
+    const r = container.querySelector(rowSelector)
+    if (r && !touched) centerChatRow(container, r)
+  }, 1100)
 }
 
 // 点击「加载更早的消息」：往上再补一窗历史，保持当前滚动位置不跳
@@ -16979,6 +17254,10 @@ function buildChatHistorySectionHTML() {
   return `
     <div class="cs-section" data-cs-tab="role">
       <div class="cs-section-label">聊天记录</div>
+      <button class="cs-action-row" id="btn-search-chat">
+        <i class="fa fa-magnifying-glass"></i><span>查找聊天记录</span>
+        <i class="fa fa-angle-right cs-arrow"></i>
+      </button>
       <button class="cs-action-row" id="btn-export-chat">
         <i class="fa fa-download"></i><span>导出聊天记录</span>
         <i class="fa fa-angle-right cs-arrow"></i>
@@ -17028,6 +17307,13 @@ function bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char) {
   bindTimezoneEvents(settingsPage, chatId)
   bindStickerSettingEvents(settingsPage, chatId, chatPage)
   bindVoiceIdEvents(settingsPage, chatId)
+  settingsPage.querySelector('#btn-search-chat')?.addEventListener('click', () => {
+    if (settingsPage.dataset.csDirty === '1') {
+      window.toast?.('设置有未保存的修改，请先保存或返回后再查找')
+      return
+    }
+    openChatHistorySearch(chatPage, chatId, charId, settingsPage)
+  })
   settingsPage.querySelector('#btn-export-chat').addEventListener('click', () => exportChat(chatId, charId, char))
   bindImportChat(settingsPage, chatId, chatPage)
   settingsPage.querySelector('#btn-clear-chat').addEventListener('click', () => clearChatConfirm(chatId, char, chatPage))
