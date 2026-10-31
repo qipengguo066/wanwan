@@ -14,8 +14,8 @@
     { id: 'm', name: '成熟向' },
     { id: 'e', name: '限制级' }
   ]
-  // 归档警告只作为标签使用
-  const WARNINGS = ['无归档警告适用', '详细描写暴力', '主要角色死亡', '未成年相关','非自愿性描写', '选择不使用归档警告']
+  // 归档警告只作为标签使用；不提供“未成年相关”这一项
+  const WARNINGS = ['无归档警告适用', '详细描写暴力', '主要角色死亡', '非自愿性描写', '选择不使用归档警告']
   const CATS = ['无CP / Gen', '男男', '女女', '男女', '多人', '其他']
   const THEME_GROUPS = [
     { id: 'world', name: '世界观', options: ['校园', '现代都市', '古代', '穿越', '仙侠', '末日', '职场', '娱乐圈', '科幻', '悬疑', '西幻'] },
@@ -49,6 +49,7 @@
     if (!Array.isArray(store.bookmarks)) store.bookmarks = []
     if (!Array.isArray(store.kudos)) store.kudos = []
     if (typeof store.seq !== 'number') store.seq = 1
+    if (!store.voices || typeof store.voices !== 'object') store.voices = {}
     // 上次生成到一半就被关掉的作品：标记为失败，可以重试
     store.works.forEach(w => {
       if (w.status === 'generating') { w.status = (w.chapters && w.chapters.length) ? 'ready' : 'failed'; w.failReason = '上次生成被中断，请重试' }
@@ -199,20 +200,25 @@
     if (busy) { window.toast?.('正在生成，请稍候'); return }
     if (typeof window.callAI !== 'function') { window.toast?.('请先在设置里配置 API'); return }
     busy = true
-    const isContinue = mode === 'continue'
-    const chapN = isContinue ? opts.chapN : work.chapterCount
+    // rewrite：重写第 rewriteAt+1 章。写好之前旧章节原样保留，失败也不会丢；写好后这一章及之后的章节被新的一章取代
+    const isRewrite = mode === 'rewrite'
+    const rwAt = isRewrite ? Math.max(0, Math.min(parseInt(opts.rewriteAt, 10) || 0, (work.chapters || []).length - 1)) : -1
+    const isContinue = mode === 'continue' || (isRewrite && rwAt > 0)
+    const apiMode = isContinue ? 'continue' : 'new'
+    const chapN = isRewrite ? 1 : (isContinue ? opts.chapN : work.chapterCount)
     const per = work.wordsPerChapter || 1500
-    const startNo = isContinue ? (work.chapters.length + 1) : 1
-    if (isContinue) work.continuing = true
+    const startNo = isRewrite ? rwAt + 1 : (isContinue ? (work.chapters.length + 1) : 1)
+    const promptWork = isRewrite ? Object.assign({}, work, { chapters: (work.chapters || []).slice(0, rwAt) }) : work
+    if (isContinue || isRewrite) work.continuing = true
     else { work.status = 'generating'; work.failReason = '' }
-    progressText[workId] = '正在等待接口返回，较长的文章可能需要几分钟…'
+    progressText[workId] = isRewrite ? `正在重写第 ${rwAt + 1} 章…` : '正在等待接口返回，较长的文章可能需要几分钟…'
     await persist()
     refreshReaderIfOpen(workId)
     refreshList()
     try {
       const ctx = await buildContext(work)
-      const raw = await window.callAI([{ role: 'user', content: userPrompt(mode, ctx, work, chapN, per, startNo, opts.direction) }], {
-        system: systemPrompt(mode, ctx, work, chapN, per, startNo),
+      const raw = await window.callAI([{ role: 'user', content: userPrompt(apiMode, ctx, promptWork, chapN, per, startNo, opts.direction) }], {
+        system: systemPrompt(apiMode, ctx, promptWork, chapN, per, startNo),
         temperature: 0.85
       })
       const parsed = parseGenerated(raw)
@@ -226,7 +232,12 @@
         if (!/^第\s*\d+\s*章/.test(title)) title = '第 ' + no + ' 章 · ' + title
         return { title: title.replace(/^第\s*\d+\s*章/, '第 ' + no + ' 章'), body: c.body }
       })
-      if (isContinue) {
+      if ((isContinue || isRewrite) && opts.direction && chaps[0]) chaps[0].dir = opts.direction
+      if (chaps.length) chaps[chaps.length - 1].nextDirs = parsed.next || []
+      if (isRewrite) {
+        work.chapters = (work.chapters || []).slice(0, rwAt).concat(chaps)
+        work.continuing = false
+      } else if (isContinue) {
         work.chapters = (work.chapters || []).concat(chaps)
         work.continuing = false
       } else {
@@ -241,9 +252,9 @@
       work.words = workWords(work)
       work.failReason = ''
       await persist()
-      window.toast?.(isContinue ? `已续写 ${chaps.length} 章` : `已生成「${work.title}」`)
+      window.toast?.(isRewrite ? `已重写第 ${rwAt + 1} 章` : isContinue ? `已续写 ${chaps.length} 章` : `已生成「${work.title}」`)
     } catch (e) {
-      if (isContinue) work.continuing = false
+      if (isContinue || isRewrite) work.continuing = false
       else work.status = 'failed'
       work.failReason = String((e && e.message) || '生成失败').slice(0, 120)
       await persist()
@@ -251,7 +262,7 @@
     } finally {
       busy = false
       delete progressText[workId]
-      refreshReaderIfOpen(workId, isContinue ? (work.chapters.length - 1) : 0)
+      refreshReaderIfOpen(workId, isRewrite ? rwAt : isContinue ? (work.chapters.length - 1) : 0)
       refreshList()
     }
   }
@@ -507,6 +518,8 @@
     if (document.getElementById('ao3-read-page')) return
     const w = getWork(id)
     if (!w) return
+    ttsStop(true)
+    ttsInit()
     readState = { id, ci: 0 }
     if (w.status === 'ready') { w.hits = (w.hits || 0) + 1; persist() }
     const page = document.createElement('div')
@@ -519,7 +532,8 @@
       </div>
       <div class="ao3-read-main" id="ao3-read-main"></div>
       <div class="ao3-read-actions" id="ao3-read-actions"></div>`
-    page.querySelector('#ao3-read-back').addEventListener('click', () => { window.closePage('ao3-read-page'); refreshList() })
+    page.querySelector('#ao3-read-back').addEventListener('click', () => { ttsStop(true); window.closePage('ao3-read-page'); refreshList() })
+    ;['touchstart', 'wheel'].forEach(ev => page.querySelector('#ao3-read-main').addEventListener(ev, () => { tts.touchAt = Date.now() }, { passive: true }))
     window.openPage(page)
     renderReader()
   }
@@ -558,7 +572,7 @@
       const banner = w.continuing ? `<div class="ao3-cont-banner"><div class="ao3-spinner small"></div><span>${esc(progressText[w.id] || '续写中…')}</span></div>` : ''
       const dirs = (!w.continuing && readState.ci === chaps.length - 1 && (w.nextDirections || []).length)
         ? `<div class="ao3-dir-hint"><b>后续可走的方向</b>${w.nextDirections.map((d, i) => `<span>方向${i + 1}：${esc(d)}</span>`).join('')}<em>点底栏「继续」选择方向并追加章节</em></div>` : ''
-      body = nav + banner + `<div class="ao3-chapter"><h3>${esc(cur ? cur.title : '')}</h3><div class="ao3-chapter-body">${cur ? bodyHTML(cur.body) : ''}</div>${dirs}</div>`
+      body = nav + banner + ttsBarHTML() + `<div class="ao3-chapter"><h3>${esc(cur ? cur.title : '')}</h3><div class="ao3-chapter-body">${cur ? segHTML(segmentChapter(cur.body).segs) : ''}</div>${dirs}</div>`
     }
     page.querySelector('#ao3-read-main').innerHTML =
       `<div class="ao3-preface"><h2 class="title">${esc(w.title)}</h2><div class="byline">by ${esc(w.author)}</div>${symHTML(w)}<dl class="ao3-meta-dl">${metaRows}</dl>${w.summary ? `<blockquote class="ao3-summary"><b>Summary:</b> ${esc(w.summary)}</blockquote>` : ''}</div>` + body
@@ -569,16 +583,19 @@
       `<button type="button" data-act="kudos" class="${liked ? 'on' : ''}"${canAct ? '' : ' disabled'}>${liked ? '已点赞' : '点赞'}</button>` +
       `<button type="button" data-act="bm" class="${marked ? 'on' : ''}"${canAct ? '' : ' disabled'}>${marked ? '已加书签' : '加书签'}</button>` +
       `<button type="button" data-act="cont"${canAct ? '' : ' disabled'}>${w.continuing ? '续写中…' : '继续'}</button>` +
-      `<button type="button" data-act="del" class="danger"${w.continuing ? ' disabled' : ''}>删除</button>`
+      `<button type="button" data-act="chap"${canAct ? '' : ' disabled'}>本章管理</button>` +
+      `<button type="button" data-act="del" class="danger"${w.continuing ? ' disabled' : ''}>删除全文</button>`
     const main = page.querySelector('#ao3-read-main')
     main.querySelector('.ao3-chap-nav')?.addEventListener('click', e => {
       const b = e.target.closest('[data-ci]')
       if (!b) return
+      ttsStop(false)
       readState.ci = Number(b.dataset.ci) || 0
       renderReader()
       main.scrollTop = 0
     })
     main.querySelector('#ao3-retry')?.addEventListener('click', () => generate(w.id, 'new'))
+    bindTtsUI(main)
     page.querySelector('#ao3-read-actions').onclick = async e => {
       const b = e.target.closest('[data-act]')
       if (!b || b.disabled) return
@@ -593,16 +610,539 @@
         await persist(); renderReader()
       } else if (act === 'cont') {
         openContinuePad(w)
+      } else if (act === 'chap') {
+        openChapterPad(w)
       } else if (act === 'del') {
-        if (!window.confirm('删除「' + w.title + '」？删除后无法恢复。')) return
+        if (!window.confirm('删除整篇「' + w.title + '」？删除后无法恢复。\n（只想删掉某一章，请用「本章管理」）')) return
         store.works = store.works.filter(x => x.id !== w.id)
         store.bookmarks = store.bookmarks.filter(x => x !== w.id)
         store.kudos = store.kudos.filter(x => x !== w.id)
         await persist()
+        ttsStop(true)
         window.closePage('ao3-read-page')
         refreshList()
       }
     }
+  }
+
+  // ===== 朗读：旁白 + 每个角色各用一个音色，整章按顺序读，读到哪句高亮哪句 =====
+  // 声音来源：旁白/你 在「朗读设置」里填音色 ID；角色默认用微信聊天设置里的音色。
+  // 复用 wechat.js 通过 window._wechatCallHelpers 暴露的 callTTS / getChatVoiceId。
+  const TTS_RATES = [1, 1.25, 1.5]
+  // iPhone 只认「被点击解锁过」的 Audio 元素：点朗读时解锁一次，之后整章都复用它，只换 src
+  const TTS_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  const tts = { playing: false, blocked: false, token: 0, plan: null, idx: 0, audio: null, rate: 1, wake: null, touchAt: 0 }
+
+  function ttsSleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+  function ttsUniq(arr) { return Array.from(new Set(arr.map(x => String(x == null ? '' : x).trim()).filter(Boolean))) }
+
+  // 单个片段的排版（和 bodyHTML 同样的标记规则）
+  function inlineHTML(slice) {
+    let h = esc(slice)
+    h = h.replace(/“([^”\n]*)”/g, '<span class="ao3-say">“$1”</span>')
+    h = h.replace(/（([^）\n]*)）/g, '<span class="ao3-think">（$1）</span>')
+    h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+    h = h.replace(/〔([^〕\n]*)〕/g, '<span class="ao3-env">〔$1〕</span>')
+    return h
+  }
+
+  // 把一段旁白切成句子级的小块（括号里不切），小块拼起来恰好等于原文
+  function splitNarration(str) {
+    const out = []
+    let cur = '', depth = 0, n = 0
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i]
+      cur += ch
+      if (ch === '（' || ch === '〔' || ch === '(') depth++
+      else if ((ch === '）' || ch === '〕' || ch === ')') && depth > 0) depth--
+      if (/\S/.test(ch)) n++
+      if (depth > 0) continue
+      const end = /[。！？!?…]/.test(ch) || ch === '\n'
+      if (end && !/[。！？!?…”）」』]/.test(str[i + 1] || '')) {
+        if (ch === '\n' || n >= 45) { out.push(cur); cur = ''; n = 0 }
+      } else if (n >= 110 && /[，、；,;]/.test(ch)) {
+        out.push(cur); cur = ''; n = 0
+      }
+    }
+    if (cur) out.push(cur)
+    return out
+  }
+
+  function ttsCleanText(t) {
+    const r = String(t || '').replace(/[“”「」『』（）〔〕()*]/g, '').replace(/\s+/g, ' ').trim()
+    return /[\u4e00-\u9fa5A-Za-z0-9]/.test(r) ? r : ''
+  }
+
+  // 切分一章：对白（“…”）和旁白交替，片段首尾相接、拼起来等于整章正文
+  function segmentChapter(body) {
+    const s = normalizeBody(body)
+    const segs = []
+    const re = /“[^”\n]*”/g
+    const pushNarr = str => { if (str) splitNarration(str).forEach(t => segs.push({ text: t, kind: 'narr' })) }
+    let last = 0, m
+    while ((m = re.exec(s))) {
+      pushNarr(s.slice(last, m.index))
+      segs.push({ text: m[0], kind: 'say' })
+      last = re.lastIndex
+    }
+    pushNarr(s.slice(last))
+    let pos = 0
+    segs.forEach(sg => { sg.start = pos; pos += sg.text.length; sg.end = pos; sg.speak = ttsCleanText(sg.text) })
+    return { s, segs }
+  }
+
+  function segHTML(segs) {
+    return segs.map((sg, i) => sg.speak
+      ? `<span class="ao3-seg" data-si="${i}">${inlineHTML(sg.text)}</span>`
+      : inlineHTML(sg.text)).join('')
+  }
+
+  // 在一小段文字里找角色名；「对/向/给…某某」里的名字是听话的人，不算说话人
+  function ttsFindRole(str, roles, fromEnd) {
+    let best = null
+    roles.forEach(r => r.names.forEach(n => {
+      let idx = fromEnd ? str.lastIndexOf(n) : str.indexOf(n)
+      while (idx >= 0) {
+        if (!/[对向朝给跟和同与]/.test(str[idx - 1] || '')) {
+          const dist = fromEnd ? str.length - (idx + n.length) : idx
+          if (!best || dist < best.dist || (dist === best.dist && n.length > best.len)) best = { key: r.key, dist, len: n.length }
+          break
+        }
+        idx = fromEnd ? (idx > 0 ? str.lastIndexOf(n, idx - 1) : -1) : str.indexOf(n, idx + 1)
+      }
+    }))
+    return best
+  }
+
+  // 判断每句对白是谁说的：看引号前后的旁白里离得最近的角色名；没有名字就沿用上一个 / 两人轮流
+  function assignSpeakers(s, segs, roles) {
+    const hist = []
+    let prev = null, prevEnd = -1
+    const second = roles[1] ? roles[1].key : 'user'
+    segs.forEach(sg => {
+      if (sg.kind !== 'say') { sg.role = 'narrator'; return }
+      const lineStart = s.lastIndexOf('\n', sg.start - 1) + 1
+      let bs = Math.max(lineStart, sg.start - 40)
+      if (prevEnd > bs) bs = prevEnd
+      const before = s.slice(bs, sg.start)
+      let le = s.indexOf('\n', sg.end)
+      if (le < 0) le = s.length
+      const nq = s.indexOf('“', sg.end)
+      const after = s.slice(sg.end, Math.min(le, nq >= 0 ? nq : le, sg.end + 24))
+      const a = ttsFindRole(after, roles, false)
+      const b = ttsFindRole(before, roles, true)
+      let key = null
+      if (a && b) key = b.dist <= a.dist ? b.key : a.key
+      else if (a || b) key = (a || b).key
+      if (!key) {
+        const sameLine = prev && prevEnd >= 0 && s.slice(prevEnd, sg.start).indexOf('\n') < 0
+        if (sameLine) key = prev
+        else if (!prev) key = second
+        else {
+          const other = hist.slice().reverse().find(k => k !== prev)
+          key = other || (prev === 'user' ? second : 'user')
+        }
+      }
+      if (hist[hist.length - 1] !== key) hist.push(key)
+      prev = key
+      prevEnd = sg.end
+      sg.role = key
+    })
+  }
+
+  async function ttsRoles(w) {
+    const roles = []
+    let user = null
+    try { user = await db.characters.get(w.ownerUid) } catch (_) {}
+    roles.push({
+      key: 'user',
+      label: (user && (user.nick || user.name)) || (w.characters && w.characters[0]) || '我',
+      names: ttsUniq([user && user.nick, user && user.name, w.characters && w.characters[0]])
+    })
+    for (const id of (w.charIds || [])) {
+      let c = null
+      try { c = await db.characters.get(id) } catch (_) {}
+      if (c) roles.push({ key: String(id), id, label: charName(c), names: ttsUniq([c.nick, c.name]) })
+    }
+    return roles
+  }
+
+  async function ttsResolveVoices(w, roles) {
+    const H = window._wechatCallHelpers
+    const saved = store.voices || {}
+    const out = { narrator: String(saved.narrator || '').trim() }
+    for (const r of roles) {
+      let v = String(saved[r.key] || '').trim()
+      if (!v && r.id) {
+        try {
+          const chat = await db.chats.where('[ownerUid+charId]').equals([w.ownerUid, r.id]).first()
+          if (chat) v = String((await H.getChatVoiceId(chat.id)) || '').trim()
+        } catch (_) {}
+      }
+      out[r.key] = v
+    }
+    out.any = out.narrator || roles.map(r => out[r.key]).find(Boolean) || ''
+    return out
+  }
+
+  function ttsSegAudio(plan, i) {
+    if (plan.cache.has(i)) return plan.cache.get(i)
+    const sg = plan.segs[i]
+    const voice = plan.voices[sg.role] || plan.voices.narrator || plan.voices.any
+    const p = (async () => {
+      const H = window._wechatCallHelpers
+      for (let k = 0; k < 2; k++) {
+        try { return await H.callTTS(sg.speak, voice) } catch (e) {
+          if (k === 1) { console.warn('[ao3] 朗读合成失败', e); return null }
+          await ttsSleep(700)
+        }
+      }
+      return null
+    })()
+    plan.cache.set(i, p)
+    p.then(u => { if (!u) plan.cache.delete(i) })
+    return p
+  }
+
+  function ttsNextSpeakable(plan, i) {
+    for (let k = i + 1; k < plan.segs.length; k++) if (plan.segs[k].speak) return k
+    return -1
+  }
+
+  function ttsUnlock() {
+    const ka = document.getElementById('keepalive-audio')
+    if (ka) { try { ka.volume = 0; ka.play().catch(() => {}) } catch (_) {} }
+    if (!tts.audio) { tts.audio = new Audio(); tts.audio.preload = 'auto' }
+    const a = tts.audio
+    if (a._unlocked) return
+    try {
+      a.src = TTS_SILENT_WAV
+      const p = a.play()
+      if (p && p.then) p.then(() => { a._unlocked = true; if (String(a.src).startsWith('data:audio/wav')) a.pause() }).catch(() => {})
+    } catch (_) {}
+  }
+
+  function ttsPlayUrl(url, token) {
+    return new Promise(resolve => {
+      const a = tts.audio
+      let done = false
+      const fin = ok => {
+        if (done) return
+        done = true
+        a.onended = null; a.onerror = null
+        if (tts.wake === wake) tts.wake = null
+        resolve(ok)
+      }
+      const wake = () => fin(false)
+      tts.wake = wake
+      a.onended = () => fin(true)
+      a.onerror = () => fin(false)
+      a.src = url
+      a.defaultPlaybackRate = tts.rate
+      a.playbackRate = tts.rate
+      const p = a.play()
+      if (p && p.catch) p.catch(() => { if (token === tts.token) tts.blocked = true; fin(false) })
+    })
+  }
+
+  function ttsClearPlan() {
+    const p = tts.plan
+    tts.plan = null
+    tts.idx = 0
+    if (p) p.cache.forEach(pr => pr.then(u => { if (u) { try { URL.revokeObjectURL(u) } catch (_) {} } }).catch(() => {}))
+  }
+
+  function ttsMark(idx) {
+    const main = document.getElementById('ao3-read-main')
+    if (!main) return
+    main.querySelectorAll('.ao3-seg.playing').forEach(x => x.classList.remove('playing'))
+    if (idx < 0 || !tts.plan || tts.plan.ci !== readState.ci || tts.plan.wid !== readState.id) return
+    const el = main.querySelector(`.ao3-seg[data-si="${idx}"]`)
+    if (!el) return
+    el.classList.add('playing')
+    if (Date.now() - tts.touchAt < 4000) return // 你正在自己滑动时不抢滚动
+    const mr = main.getBoundingClientRect(), er = el.getBoundingClientRect()
+    if (er.top < mr.top + 70 || er.bottom > mr.bottom - 110) {
+      main.scrollTo({ top: main.scrollTop + (er.top - mr.top) - mr.height * 0.35, behavior: 'smooth' })
+    }
+  }
+
+  function ttsUpdateBar() {
+    const bar = document.getElementById('ao3-tts-bar')
+    if (!bar) return
+    const btn = bar.querySelector('[data-tts="toggle"]')
+    btn.classList.toggle('on', tts.playing)
+    btn.innerHTML = tts.playing
+      ? '<i class="fa-solid fa-pause"></i><span>暂停</span>'
+      : '<i class="fa-solid fa-play"></i><span>朗读</span>'
+    bar.querySelector('[data-tts="rate"]').textContent = tts.rate + 'x'
+    const prog = bar.querySelector('.ao3-tts-prog')
+    const p = tts.plan
+    if (prog) {
+      if (p && p.ci === readState.ci && p.wid === readState.id) {
+        const total = p.segs.filter(s => s.speak).length
+        const done = p.segs.slice(0, tts.idx).filter(s => s.speak).length
+        prog.textContent = (tts.playing || done) ? `${Math.min(done + (tts.playing ? 1 : 0), total)}/${total}` : ''
+      } else prog.textContent = ''
+    }
+  }
+
+  function ttsStop(clear) {
+    tts.token++
+    tts.playing = false
+    if (tts.wake) { try { tts.wake() } catch (_) {} }
+    if (tts.audio) { try { tts.audio.pause() } catch (_) {} }
+    if (clear) ttsClearPlan()
+    ttsMark(-1)
+    ttsUpdateBar()
+  }
+
+  // 准备当前章节的朗读计划（切句、判断说话人、取音色）；同一章同一正文会复用，暂停后可接着读
+  async function ttsPrepare(w, fromIdx, token) {
+    const cur = (w.chapters || [])[readState.ci]
+    if (!cur) return false
+    const reuse = !!(tts.plan && tts.plan.wid === w.id && tts.plan.ci === readState.ci && tts.plan.body === cur.body)
+    if (!reuse) {
+      ttsClearPlan()
+      const { s, segs } = segmentChapter(cur.body)
+      const roles = await ttsRoles(w)
+      if (token !== tts.token) return false
+      assignSpeakers(s, segs, roles)
+      const voices = await ttsResolveVoices(w, roles)
+      if (token !== tts.token) return false
+      tts.plan = { wid: w.id, ci: readState.ci, body: cur.body, segs, roles, voices, cache: new Map() }
+    }
+    let idx = typeof fromIdx === 'number' ? fromIdx : (reuse ? tts.idx : 0)
+    if (idx >= tts.plan.segs.length) idx = 0
+    tts.idx = idx
+    return true
+  }
+
+  async function ttsRun(token) {
+    let finished = false
+    try {
+      while (token === tts.token) {
+        if (!document.getElementById('ao3-read-page')) break
+        const plan = tts.plan
+        if (!plan) break
+        if (tts.idx >= plan.segs.length) {
+          const cw = getWork(plan.wid)
+          if (store.voices.autoNext !== false && cw && readState.ci < (cw.chapters || []).length - 1) {
+            readState.ci++
+            renderReader()
+            const m = document.getElementById('ao3-read-main')
+            if (m) m.scrollTop = 0
+            if (!(await ttsPrepare(cw, 0, token))) break
+            continue
+          }
+          tts.idx = 0
+          finished = true
+          break
+        }
+        const sg = plan.segs[tts.idx]
+        if (!sg.speak) { tts.idx++; continue }
+        const cur = tts.idx
+        ttsMark(cur)
+        ttsUpdateBar()
+        const url = await ttsSegAudio(plan, cur)
+        if (token !== tts.token) return
+        const next = ttsNextSpeakable(plan, cur)
+        if (next >= 0) ttsSegAudio(plan, next) // 这句拿到了，再提前合成下一句
+        if (!url) {
+          if (!tts.warned) { tts.warned = true; window.toast?.('有的句子朗读失败，已跳过') }
+          tts.idx++
+          continue
+        }
+        await ttsPlayUrl(url, token)
+        if (token !== tts.token) return
+        if (tts.blocked) { window.toast?.('手机拦截了自动播放，请再点一次「朗读」'); break }
+        tts.idx++
+        await ttsSleep(/\n\s*$/.test(sg.text) ? 260 : 90)
+      }
+    } catch (e) {
+      console.warn('[ao3] 朗读出错', e)
+      window.toast?.('朗读出错：' + (e && e.message || e))
+    } finally {
+      if (token === tts.token) {
+        ttsStop(false)
+        if (finished) window.toast?.('朗读完毕')
+      }
+    }
+  }
+
+  async function ttsStart(w, fromIdx) {
+    const H = window._wechatCallHelpers
+    if (!H || typeof H.callTTS !== 'function' || typeof H.getChatVoiceId !== 'function') {
+      window.toast?.('朗读功能还没就绪，请先打开一次微信再试')
+      return
+    }
+    ttsUnlock() // 必须在点击手势里、其他 await 之前同步执行
+    if (!w) return
+    tts.token++
+    const token = tts.token
+    tts.playing = true
+    tts.blocked = false
+    tts.warned = false
+    ttsUpdateBar()
+    let ok = false
+    try { ok = await ttsPrepare(w, fromIdx, token) } catch (e) { console.warn('[ao3] 朗读准备失败', e) }
+    if (token !== tts.token) return
+    if (!ok) { ttsStop(false); window.toast?.('这一章还没有内容可读'); return }
+    if (!tts.plan.voices.any) {
+      ttsStop(false)
+      window.toast?.('还没有设置任何音色，请先在「朗读设置」里填')
+      openTtsPad(w)
+      return
+    }
+    ttsRun(token)
+  }
+
+  function ttsInit() {
+    const r = store.voices && store.voices.rate
+    tts.rate = TTS_RATES.includes(r) ? r : 1
+  }
+
+  function ttsBarHTML() {
+    return `<div class="ao3-tts-bar" id="ao3-tts-bar">
+      <button type="button" class="ao3-tts-main" data-tts="toggle"><i class="fa-solid fa-play"></i><span>朗读</span></button>
+      <span class="ao3-tts-prog"></span>
+      <button type="button" class="ao3-tts-mini" data-tts="rate">${tts.rate}x</button>
+      <button type="button" class="ao3-tts-mini" data-tts="set" aria-label="朗读设置"><i class="fa-solid fa-sliders"></i></button>
+    </div>`
+  }
+
+  function bindTtsUI(main) {
+    main.querySelector('#ao3-tts-bar')?.addEventListener('click', e => {
+      const b = e.target.closest('[data-tts]')
+      if (!b) return
+      const act = b.dataset.tts
+      if (act === 'toggle') {
+        if (tts.playing) ttsStop(false)
+        else ttsStart(getWork(readState.id))
+      } else if (act === 'rate') {
+        tts.rate = TTS_RATES[(TTS_RATES.indexOf(tts.rate) + 1) % TTS_RATES.length]
+        if (tts.audio) { tts.audio.defaultPlaybackRate = tts.rate; tts.audio.playbackRate = tts.rate }
+        store.voices.rate = tts.rate
+        persist()
+        ttsUpdateBar()
+      } else if (act === 'set') {
+        openTtsPad(getWork(readState.id))
+      }
+    })
+    // 朗读时点一句话，从这句开始读
+    main.querySelector('.ao3-chapter-body')?.addEventListener('click', e => {
+      if (!tts.playing) return
+      const el = e.target.closest('.ao3-seg')
+      if (!el) return
+      const si = Number(el.dataset.si)
+      if (!tts.plan || !tts.plan.segs[si] || !tts.plan.segs[si].speak) return
+      ttsStop(false)
+      ttsStart(getWork(readState.id), si)
+    })
+    ttsUpdateBar()
+    if (tts.playing) ttsMark(tts.idx)
+  }
+
+  async function openTtsPad(w) {
+    const page = document.getElementById('ao3-read-page')
+    if (!page || !w || page.querySelector('.ao3-tts-pad')) return
+    const roles = await ttsRoles(w)
+    if (!document.getElementById('ao3-read-page') || page.querySelector('.ao3-tts-pad')) return
+    const v = store.voices || {}
+    const rows = [{ key: 'narrator', label: '旁白', ph: '填音色 ID' }].concat(roles.map(r => ({
+      key: r.key,
+      label: r.key === 'user' ? r.label + '（你）' : r.label,
+      ph: r.key === 'user' ? '填音色 ID（留空用旁白的声音）' : '留空 = 用微信聊天设置里的音色'
+    })))
+    const bd = document.createElement('div')
+    bd.className = 'ao3-continue-backdrop ao3-tts-pad show'
+    bd.innerHTML = `
+      <div class="ao3-continue-card">
+        <h2>朗读设置</h2>
+        <p class="ao3-continue-tip">给旁白和每个角色各指定一个音色 ID（和微信聊天设置里填的是同一种）。没有音色的角色会用旁白的声音；旁白也没填，就用任意一个已设置的音色。</p>
+        ${rows.map(r => `<label class="ao3-continue-label">${esc(r.label)}</label><input class="ao3-input" data-vk="${esc(r.key)}" value="${esc(v[r.key] || '')}" placeholder="${esc(r.ph)}" autocomplete="off" autocapitalize="off" spellcheck="false">`).join('')}
+        <label class="ao3-tts-check"><input type="checkbox" id="ao3-tts-next"${v.autoNext === false ? '' : ' checked'}><span>读完一章自动接着读下一章</span></label>
+        <div class="ao3-continue-btns"><button type="button" class="ao3-btn-ghost" id="ao3-tts-cancel">取消</button><button type="button" class="ao3-submit ao3-continue-go" id="ao3-tts-save">保存</button></div>
+      </div>`
+    page.appendChild(bd)
+    bd.addEventListener('click', e => { if (e.target === bd) bd.remove() })
+    bd.querySelector('#ao3-tts-cancel').addEventListener('click', () => bd.remove())
+    bd.querySelector('#ao3-tts-save').addEventListener('click', async () => {
+      const nv = { rate: store.voices.rate }
+      bd.querySelectorAll('[data-vk]').forEach(inp => {
+        const val = inp.value.trim()
+        if (val) nv[inp.dataset.vk] = val
+      })
+      nv.autoNext = bd.querySelector('#ao3-tts-next').checked
+      store.voices = nv
+      await persist()
+      bd.remove()
+      ttsStop(true) // 音色变了，下次点朗读按新设置重新来
+      window.toast?.('已保存')
+    })
+  }
+
+  // ===== 本章管理：重写这一章 / 删除这一章及之后的章节 =====
+  // 章节之间剧情是接着写的，所以不能只抽掉中间的一章：重写和删除都会连带删掉它后面的章节。
+  async function rollbackChapters(w, keep) {
+    const removed = (w.chapters || []).length - keep
+    if (keep < 1 || removed < 1) return
+    ttsStop(true)
+    w.chapters = w.chapters.slice(0, keep)
+    const last = w.chapters[keep - 1]
+    w.nextDirections = (last && last.nextDirs) || []
+    w.words = workWords(w)
+    await persist()
+    readState.ci = keep - 1
+    renderReader()
+    const m = document.getElementById('ao3-read-main')
+    if (m) m.scrollTop = 0
+    refreshList()
+    window.toast?.(`已删除 ${removed} 章`)
+  }
+
+  function openChapterPad(w) {
+    if (busy || w.continuing) { window.toast?.('正在生成，请稍候'); return }
+    const page = document.getElementById('ao3-read-page')
+    if (!page || page.querySelector('.ao3-chap-pad')) return
+    const chaps = w.chapters || []
+    const ci = Math.min(readState.ci, chaps.length - 1)
+    const cur = chaps[ci]
+    if (!cur) return
+    const later = chaps.length - ci - 1
+    let dir = ''
+    for (let j = ci; j >= 0; j--) { if (chaps[j] && chaps[j].dir) { dir = chaps[j].dir; break } }
+    const titleShort = String(cur.title || '').replace(/ · .*/, '')
+    const bd = document.createElement('div')
+    bd.className = 'ao3-continue-backdrop ao3-chap-pad show'
+    bd.innerHTML = `
+      <div class="ao3-continue-card">
+        <h2>${esc(titleShort)} · 本章管理</h2>
+        <p class="ao3-continue-tip">只改这一章，不会动前面的章节。${later ? `后面的 ${later} 章接在这一章后面写的，所以重写或删除这一章时会一起删掉。` : '这是最后一章。'}</p>
+        <label class="ao3-continue-label">重写这一章</label>
+        <textarea id="ao3-rw-dir" class="ao3-textarea" placeholder="想怎么改？可以留空，会承接上一章重新写一个不同的版本">${esc(dir)}</textarea>
+        <button type="button" class="ao3-submit" id="ao3-rw-go" style="margin-top:8px">重写${esc(titleShort)}${later ? `（并删除后面 ${later} 章）` : ''}</button>
+        <div class="ao3-pad-sep"></div>
+        <button type="button" class="ao3-pad-danger" id="ao3-chap-del"${ci === 0 ? ' disabled' : ''}>删除${esc(titleShort)}${later ? `及之后共 ${later + 1} 章` : ''}</button>
+        <p class="ao3-continue-tip" style="margin-top:6px">${ci === 0 ? '第一章不能单独删除；想删掉整篇，请用底栏的「删除全文」。' : `删除后回到第 ${ci} 章，可以重新点「继续」往下写。`}</p>
+        <div class="ao3-continue-btns"><button type="button" class="ao3-btn-ghost" id="ao3-chap-cancel" style="flex:1">取消</button></div>
+      </div>`
+    page.appendChild(bd)
+    bd.addEventListener('click', e => { if (e.target === bd) bd.remove() })
+    bd.querySelector('#ao3-chap-cancel').addEventListener('click', () => bd.remove())
+    bd.querySelector('#ao3-rw-go').addEventListener('click', () => {
+      if (later && !window.confirm(`重写${titleShort}会同时删除后面的 ${later} 章，确定吗？`)) return
+      const direction = bd.querySelector('#ao3-rw-dir').value.trim().slice(0, 120) || '承接上一章，重新写出一个与原来不同的版本'
+      bd.remove()
+      ttsStop(true)
+      generate(w.id, 'rewrite', { rewriteAt: ci, direction })
+    })
+    bd.querySelector('#ao3-chap-del').addEventListener('click', () => {
+      if (ci === 0) return
+      if (!window.confirm(`删除${titleShort}${later ? `及之后共 ${later + 1} 章` : ''}？删除后无法恢复。`)) return
+      bd.remove()
+      rollbackChapters(w, ci)
+    })
   }
 
   // ===== 续写弹窗 =====
