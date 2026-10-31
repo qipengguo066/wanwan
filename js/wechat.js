@@ -400,6 +400,11 @@ async function getChatActiveReplySettings(chatId) {
   return normalizeChatActiveReplySettings(stored?.value)
 }
 
+async function setChatActiveReplyEnabled(chatId, enabled) {
+  const cur = await getChatActiveReplySettings(chatId)
+  await db.config.put({ key: `chatActiveReply_${chatId}`, value: { ...cur, enabled: !!enabled } })
+}
+
 function parseDayMinutes(value) {
   const normalized = normalizeDayTimeValue(value, '')
   if (!normalized) return null
@@ -2086,6 +2091,7 @@ function parseMsgType(content, charName, myName) {
   // 真实照片（特殊前缀）
   if (c.startsWith('__IMG__')) return { type: 'real-photo', data: { src: c.slice(7) } }
   if (c.startsWith('__LINK__')) return { type: 'link', data: parseLinkPayload(c.slice(8)) }
+  if (c.startsWith(SHOP_APPROVAL_PREFIX)) return { type: 'shop-approval', data: parseShopApprovalPayload(c.slice(SHOP_APPROVAL_PREFIX.length)) }
   if (c.startsWith('__TBDEAL__')) return { type: 'tb-deal', data: parseTbDealPayload(c.slice(10)) }
   if (c.startsWith('__YUMDEAL__')) return { type: 'yum-deal', data: parseYumDealPayload(c.slice(11)) }
   // 群聊新类型（特殊前缀）
@@ -2109,6 +2115,7 @@ function getWechatMessageDisplayPreview(msg, charName = '') {
     case 'photo':
     case 'real-photo': return '[图片]'
     case 'link': return '[链接]'
+    case 'shop-approval': return '[购物审批]'
     case 'transfer-recv':
     case 'transfer-resp': return '[转账]'
     case 'location': return '[位置]'
@@ -2537,6 +2544,7 @@ function renderBubbleHTML(msg, isSelf, charName, stickerMap, bilingualSettings) 
     case 'recall': return renderRecallRow(data, charName)
     case 'location': return renderLocationCard(data, cls)
     case 'link': return renderLinkCard(data, cls)
+    case 'shop-approval': return renderShopApprovalCard(data, msg, isSelf)
     case 'sticker': return renderStickerBubble(data, isSelf, msg, stickerMap)
     case 'call-record': return renderCallRecordBubble(data, cls)
     case 'red-packet': return renderRedPacketCard(data, msg)
@@ -4286,6 +4294,9 @@ function buildPlusPanelHTML() {
             <button class="plus-item" data-type="link">
               <div class="plus-icon"><i class="fa-solid fa-link"></i></div><span>链接</span>
             </button>
+            <button class="plus-item" data-type="shop-approval">
+              <div class="plus-icon"><i class="fa-solid fa-cart-shopping"></i></div><span>购物审批</span>
+            </button>
           </div>
         </div>
       </div>
@@ -4390,6 +4401,8 @@ function getMsgActionText(msg, charName) {
         : `[位置：${parsed.data.place || ''}]`
     case 'link':
       return buildLinkFallbackText(parsed.data)
+    case 'shop-approval':
+      return buildShopApprovalFallbackText(parsed.data, msg)
     default:
       return msg.content || ''
   }
@@ -5905,6 +5918,7 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       await updateCharacterStatusFromAI(chatId, charId, status)
       await applyCharScheduleFromReply(chatId, charId, _aiResult)
+      await applyShopApprovalFromReply(chatId, _aiResult)
       _activeReplyFailCount.delete(chatId)
       const lines = splitMessageLines(reply)
       const base = Date.now()
@@ -6342,7 +6356,11 @@ function normalizeWechatAIFields(parsed) {
     }
   }
   const eventDone = parsed.event_done === true || parsed.event_done === 'true'
-  return { thought, status, reply, event, eventDone }
+  let approval = null
+  if (parsed.approval && typeof parsed.approval === 'object' && !Array.isArray(parsed.approval)) {
+    approval = { title: String(parsed.approval.title || ''), decision: String(parsed.approval.decision || '') }
+  }
+  return { thought, status, reply, event, eventDone, approval }
 }
 
 // 组装报错诊断信息（结合 fetchAI 记录的最近一次响应元数据）
@@ -6821,6 +6839,9 @@ function getWechatStickerImageSrc(message, name, stickerMap) {
 async function buildWechatAIHistoryMessage(item, options = {}) {
   if (item.kind !== 'online' || !item.message) return { role: item.role, content: item.content || '' }
   const parsed = parseMsgType(item.message.content || '')
+  if (parsed.type === 'shop-approval') {
+    return { role: item.role, content: buildShopApprovalFallbackText(parsed.data, item.message) }
+  }
   if (parsed.type === 'tb-deal') {
     return { role: item.role, content: buildTbDealFallbackText(parsed.data) }
   }
@@ -6871,6 +6892,7 @@ async function buildWechatAIHistoryMessage(item, options = {}) {
 function buildWechatTextFallbackContent(item, options = {}) {
   if (item.kind !== 'online' || !item.message) return item.content || ''
   const parsed = parseMsgType(item.message.content || '')
+  if (parsed.type === 'shop-approval') return buildShopApprovalFallbackText(parsed.data, item.message)
   if (parsed.type === 'tb-deal') return buildTbDealFallbackText(parsed.data)
   if (parsed.type === 'yum-deal') return buildYumDealFallbackText(parsed.data)
   if (parsed.type === 'link') return buildLinkFallbackText(parsed.data)
@@ -8091,6 +8113,7 @@ ${thoughtLine}
 - "reply"：实际发给${userName}的内容，多条消息之间用 \\n 隔开。**必须至少包含一条可见聊天消息，不得只写状态更新格式。**
 - "event"（可选，没有就不要写这个字段）：当${charName}在这一轮消息里说出了一件会占用他一段时间、之后才能回消息的具体安排（上班、执飞、开会、出差、上课、出门办事等），填 {"title":"事件名，10字内","start_in_minutes":从现在起多少分钟后开始（马上开始填0）,"duration_minutes":预计持续多少分钟}。时长按事情的实际情况合理估算（比如执飞按航程），只填数字，不要写“明天”“待会儿”这类相对时间的文字。
 - "event_done"（可选）：当${charName}在这一轮消息里表示自己忙完了、落地了、下班了，填 true。
+- "approval"（可选）：当聊天记录里有状态为“待审批”的「购物审批」申请，并且你在这一轮回复里已经做出最终决定时，填 {"title":"商品名","decision":"approve 或 reject"}。如果你还想追问、讨价还价、没有最终决定，就不要写这个字段。决定要符合你的人设、你和${userName}的关系，以及价格和理由是否合理；批准或拒绝都要在回复里自然地说出你的理由，不要只写一个字。
 
 ✅ 正确：{"chain":"用户语气冲，可能累了…先稳住。","thought":"他今天心情不好，我得小心点…","status":"正在聊天","reply":"怎么了？\\n发生什么事了吗"}
 ✅ 无长推理：{"chain":"","thought":"他今天心情不好，我得小心点…","status":"有点担心","reply":"怎么了？\\n发生什么事了吗"}
@@ -8325,6 +8348,7 @@ function handlePlusAction(chatPage, type) {
     case 'transfer':   showTransferSheet(chatPage); break
     case 'location':   showLocationSheet(chatPage); break
     case 'link':       showVirtualLinkSheet(chatPage); break
+    case 'shop-approval': showShopApprovalPage(chatPage); break
   }
 }
 
@@ -8353,6 +8377,186 @@ function isValidHttpUrl(url) {
   } catch (_) {
     return false
   }
+}
+
+// ===== 购物审批 =====
+// 用户在聊天加号面板里发起一张“购物审批”卡片；角色在回复里表态（批准/拒绝），卡片状态随之更新。
+// 只在聊天里生效：不读取商品链接，不联动钱包、不记账。配图单独存在消息的 shopImage 字段里，不会发给 AI。
+const SHOP_APPROVAL_PREFIX = '__SHOPAPPROVAL__'
+
+function normalizeShopApproval(d) {
+  d = d && typeof d === 'object' ? d : {}
+  return {
+    title: String(d.title || '').trim().slice(0, 60),
+    price: Number(d.price) > 0 ? Math.round(Number(d.price) * 100) / 100 : 0,
+    url: String(d.url || '').trim().slice(0, 300),
+    reason: String(d.reason || '').trim().slice(0, 500),
+    deadline: Number(d.deadline) > 0 ? Number(d.deadline) : 0
+  }
+}
+
+function parseShopApprovalPayload(raw) {
+  return normalizeShopApproval(_safeJsonParse(raw, {}))
+}
+
+function buildShopApprovalContent(d) {
+  return SHOP_APPROVAL_PREFIX + JSON.stringify(normalizeShopApproval(d))
+}
+
+function shopApprovalStatusLabel(status) {
+  return status === 'approved' ? '已批准' : status === 'rejected' ? '已拒绝' : '待审批'
+}
+
+function formatShopDeadline(ts) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function buildShopApprovalFallbackText(data, msg) {
+  const d = normalizeShopApproval(data)
+  const status = shopApprovalStatusLabel(msg && msg.shopStatus)
+  const me = (typeof _wechatUser !== 'undefined' && _wechatUser && (_wechatUser.nick || _wechatUser.name)) || '用户'
+  return `[购物审批申请（${me}想买东西，向你申请）：商品「${d.title}」；价格 ¥${d.price}；理由：${d.reason || '（未写）'}` +
+    (d.deadline ? `；截止时间：${formatShopDeadline(d.deadline)}` : '') +
+    (d.url ? `；商品链接：${d.url}（系统不会读取链接内容，不要假装看过）` : '') +
+    `；当前状态：${status}]`
+}
+
+function renderShopApprovalCard(data, msg, isSelf) {
+  const d = normalizeShopApproval(data)
+  const status = (msg && msg.shopStatus) || 'pending'
+  const img = msg && msg.shopImage
+    ? `<img src="${wcEscHtml(msg.shopImage)}" alt="">`
+    : '<i class="fa-solid fa-cart-shopping"></i>'
+  const deadline = d.deadline ? `<div class="shop-card-foot">截止时间：${wcEscHtml(formatShopDeadline(d.deadline))}</div>` : ''
+  return `
+    <div class="msg-card shop-card card-${isSelf ? 'self' : 'other'}" data-status="${status}">
+      <div class="shop-card-head"><span>购物审批</span><span class="shop-card-status status-${status}">${shopApprovalStatusLabel(status)}</span></div>
+      <div class="shop-card-body">
+        <div class="shop-card-img">${img}</div>
+        <div class="shop-card-main">
+          <div class="shop-card-title">${wcEscHtml(d.title)}</div>
+          <div class="shop-card-price">¥ ${wcEscHtml(d.price.toFixed(2))}</div>
+        </div>
+      </div>
+      <div class="shop-card-reason">${wcEscHtml(d.reason)}</div>
+      ${deadline}
+    </div>`
+}
+
+async function applyShopApprovalFromReply(chatId, result) {
+  try {
+    const ap = result && result.approval
+    if (!ap) return
+    const decision = /approve|批准|同意/i.test(ap.decision) ? 'approved' : /reject|拒绝|不同意/i.test(ap.decision) ? 'rejected' : ''
+    if (!decision) return
+    const rows = await db.messages.where('chatId').equals(Number(chatId)).reverse().limit(80).toArray()
+    const pending = rows.filter(r => r.role === 'user' && typeof r.content === 'string' &&
+      r.content.startsWith(SHOP_APPROVAL_PREFIX) && (r.shopStatus || 'pending') === 'pending')
+    if (!pending.length) return
+    const t = String(ap.title || '').trim()
+    let target = null
+    if (t) {
+      target = pending.find(r => {
+        const d = parseShopApprovalPayload(r.content.slice(SHOP_APPROVAL_PREFIX.length))
+        return d.title && (d.title.includes(t) || t.includes(d.title))
+      })
+    }
+    if (!target) target = pending[0] // 倒序读取，第一条就是最新的待审批
+    await db.messages.update(target.id, { shopStatus: decision })
+  } catch (e) { console.warn('[wechat] 更新购物审批状态失败', e) }
+}
+
+function shopCompressImage(src, maxSize = 240) {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height))
+        const w = Math.max(1, Math.round(img.width * scale))
+        const h = Math.max(1, Math.round(img.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h)
+        resolve(canvas.toDataURL('image/jpeg', 0.8))
+      } catch (_) { resolve('') }
+    }
+    img.onerror = () => resolve('')
+    img.src = src
+  })
+}
+
+function showShopApprovalPage(chatPage) {
+  if (chatPage?.dataset?.groupId) { window.toast?.('群聊里暂不支持购物审批'); return }
+  if (document.getElementById('shop-approval-page')) return
+  const now = new Date()
+  const page = document.createElement('div')
+  page.id = 'shop-approval-page'
+  page.className = 'full-page shop-approval-page'
+  page.innerHTML = `
+    <div class="shop-form-head">
+      <button class="shop-form-back" id="shop-back" type="button" aria-label="返回"><i class="fa-solid fa-angle-left"></i></button>
+      <div class="shop-form-titles"><div class="shop-form-title">购物审批</div><div class="shop-form-sub">填写并发起</div></div>
+    </div>
+    <div class="shop-form-scroll">
+      <div class="shop-form-card">
+        <div class="shop-form-top"><span>购物审批</span><span>${now.getMonth() + 1}/${now.getDate()}</span></div>
+        <div class="shop-form-grid">
+          <div class="shop-form-cell shop-form-imgcell">
+            <label>配图</label>
+            <button class="shop-img-btn" id="shop-img-btn" type="button" aria-label="选择配图"><i class="fa-solid fa-cart-shopping"></i></button>
+          </div>
+          <div class="shop-form-right">
+            <div class="shop-form-cell"><label>商品名称 <b>*</b></label><input id="shop-title" type="text" maxlength="60" autocomplete="off"></div>
+            <div class="shop-form-cell"><label>价格 <b>*</b></label><input id="shop-price" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off"></div>
+          </div>
+        </div>
+        <div class="shop-form-cell"><label>商品链接</label><input id="shop-url" type="text" autocomplete="off"></div>
+        <div class="shop-form-cell"><label>我为什么想买 <b>*</b></label><textarea id="shop-reason" rows="7" maxlength="500"></textarea></div>
+        <div class="shop-form-cell"><label>截止时间</label><input id="shop-deadline" type="datetime-local"></div>
+      </div>
+    </div>
+    <div class="shop-form-foot"><button class="shop-send-btn" id="shop-send" type="button">发起</button></div>`
+  let imageData = ''
+  page.querySelector('#shop-back').addEventListener('click', () => window.closePage('shop-approval-page'))
+  page.querySelector('#shop-img-btn').addEventListener('click', () => {
+    window.showImagePicker?.(async url => {
+      if (!url) return
+      const thumb = await shopCompressImage(url)
+      if (!thumb) { window.toast?.('这张图片读取失败'); return }
+      imageData = thumb
+      const btn = page.querySelector('#shop-img-btn')
+      btn.innerHTML = `<img src="${thumb}" alt="">`
+    })
+  })
+  page.querySelector('#shop-send').addEventListener('click', async e => {
+    const btn = e.currentTarget
+    if (btn.disabled) return
+    const title = page.querySelector('#shop-title').value.trim()
+    const price = parseFloat(page.querySelector('#shop-price').value.replace(/[^\d.]/g, ''))
+    const url = page.querySelector('#shop-url').value.trim()
+    const reason = page.querySelector('#shop-reason').value.trim()
+    const dl = page.querySelector('#shop-deadline').value
+    const deadline = dl ? Date.parse(dl) : 0
+    if (!title) { window.toast?.('请填写商品名称'); return }
+    if (!(price > 0)) { window.toast?.('请填写价格'); return }
+    if (!reason) { window.toast?.('请写一下为什么想买'); return }
+    btn.disabled = true
+    try {
+      await sendUserMsg(chatPage, buildShopApprovalContent({ title, price, url, reason, deadline }), { shopStatus: 'pending', shopImage: imageData || '' })
+      window.closePage('shop-approval-page')
+      window.toast?.('已发起，点聊天里的魔法棒让对方回复')
+    } catch (err) {
+      console.warn('[wechat] 发起购物审批失败', err)
+      window.toast?.('发起失败，请重试')
+      btn.disabled = false
+    }
+  })
+  window.openPage(page)
 }
 
 function showVirtualLinkSheet(chatPage) {
@@ -9087,33 +9291,46 @@ async function showMsgMenu(anchorEl, msgId, context) {
   setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 100)
 }
 
-// 定位菜单
-// iPhone 弹出输入法时，可见区域(visualViewport)会和整页(layout viewport)错开：
-// 以前按整页高度算位置，菜单会跑到可见区域之外，要收起输入法再上滑才能看到。
-// 现在把菜单限制在“当前真正看得到的区域”里。
+// 定位菜单：始终贴在对应消息的上缘（放不下才放下缘）
+// iPhone 弹出输入法时，整页(layout viewport)和看得见的区域(visual viewport)会错开，
+// 菜单所在容器也可能被位移。这里不再假设“fixed 的 0,0 就是屏幕左上角”，
+// 而是先量出菜单自己的原点、再量出真实可见区域，都和消息气泡用同一套坐标系来算。
 function positionMsgMenu(menu, bubbleEl) {
   const rect = bubbleEl.getBoundingClientRect()
   const gap = 8
   const edge = 8
-  const menuRect = menu.getBoundingClientRect()
-  const menuWidth = menuRect.width
-  const menuHeight = menuRect.height
+  menu.style.top = '0px'
+  menu.style.left = '0px'
+  const origin = menu.getBoundingClientRect()
+  const menuWidth = menu.offsetWidth || origin.width
+  const menuHeight = menu.offsetHeight || origin.height
+  // 真实可见区域（和 getBoundingClientRect 同一坐标系）
   const vv = window.visualViewport
-  const vTop = vv ? vv.offsetTop : 0
-  const vLeft = vv ? vv.offsetLeft : 0
-  const vWidth = vv ? vv.width : window.innerWidth
-  const vHeight = vv ? vv.height : window.innerHeight
-  const minLeft = vLeft + edge
-  const maxLeft = Math.max(minLeft, vLeft + vWidth - menuWidth - edge)
+  let visTop = 0
+  let visLeft = 0
+  let visWidth = window.innerWidth
+  let visHeight = window.innerHeight
+  try {
+    const probe = document.createElement('div')
+    probe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none'
+    document.documentElement.appendChild(probe)
+    const pr = probe.getBoundingClientRect()
+    probe.remove()
+    visTop = pr.top + (vv ? vv.offsetTop : 0)
+    visLeft = pr.left + (vv ? vv.offsetLeft : 0)
+    if (vv) { visWidth = vv.width; visHeight = vv.height }
+  } catch (_) {}
+  const minLeft = visLeft + edge
+  const maxLeft = Math.max(minLeft, visLeft + visWidth - menuWidth - edge)
   const left = Math.min(Math.max(rect.left, minLeft), maxLeft)
-  const minTop = vTop + edge
-  const maxTop = Math.max(minTop, vTop + vHeight - menuHeight - edge)
+  const minTop = visTop + edge
+  const maxTop = Math.max(minTop, visTop + visHeight - menuHeight - edge)
   const topAbove = rect.top - menuHeight - gap
   const topBelow = rect.bottom + gap
   let top = topAbove >= minTop ? topAbove : topBelow
   top = Math.min(Math.max(top, minTop), maxTop)
-  menu.style.top = top + 'px'
-  menu.style.left = left + 'px'
+  menu.style.top = (top - origin.top) + 'px'
+  menu.style.left = (left - origin.left) + 'px'
 }
 
 // 绑定菜单按钮
@@ -21905,6 +22122,8 @@ window.WanWanWechatOnline = {
 Object.defineProperty(window, '_wechatUid', { get() { return _wechatUid } })
 window._wechatCallHelpers = {
   getChatHistoryLimit,
+  getChatActiveReplySettings,
+  setChatActiveReplyEnabled,
   buildUnifiedChatTimeline,
   buildWechatReplyContext,
   estimateWechatPromptContext,

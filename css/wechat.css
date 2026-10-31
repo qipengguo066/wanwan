@@ -6768,3 +6768,53 @@ input, textarea, [contenteditable="true"] {
   -webkit-user-select: text;
   user-select: text;
 }
+
+
+/* ===== 购物审批 ===== */
+.shop-card {
+  width: 236px;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid #e8e8e8;
+  border-radius: 12px;
+  background: #fff;
+  color: #222;
+}
+.shop-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-size: 12px; letter-spacing: .12em; color: #888; }
+.shop-card-status { letter-spacing: 0; font-weight: 600; color: #888; }
+.shop-card-status.status-approved { color: #2f8f5b; }
+.shop-card-status.status-rejected { color: #c0504d; }
+.shop-card-body { display: flex; gap: 10px; align-items: center; }
+.shop-card-img { flex: 0 0 56px; width: 56px; height: 56px; border-radius: 8px; background: #f5f5f5; border: 1px solid #ececec; display: flex; align-items: center; justify-content: center; overflow: hidden; color: #777; font-size: 20px; }
+.shop-card-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shop-card-main { flex: 1; min-width: 0; }
+.shop-card-title { font-size: 14px; line-height: 1.4; font-weight: 600; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.shop-card-price { margin-top: 4px; font-size: 15px; font-weight: 700; color: #222; }
+.shop-card-reason { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #e4e4e4; font-size: 13px; line-height: 1.5; color: #555; word-break: break-word; white-space: pre-wrap; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.shop-card-foot { margin-top: 8px; font-size: 11px; color: #aaa; }
+
+.shop-approval-page { display: flex; flex-direction: column; background: #f5f5f5; }
+.shop-form-head { flex-shrink: 0; position: relative; display: flex; align-items: center; justify-content: center; padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 12px; }
+.shop-form-back { position: absolute; left: 14px; bottom: 14px; width: 34px; height: 34px; border: none; background: transparent; color: #666; font-size: 22px; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.shop-form-titles { text-align: center; }
+.shop-form-title { font-size: 20px; font-weight: 700; letter-spacing: .12em; color: #8a8a8a; }
+.shop-form-sub { margin-top: 4px; font-size: 12px; letter-spacing: .3em; color: #b0b0b0; }
+.shop-form-scroll { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 8px 16px 16px; }
+.shop-form-card { border: 1px solid #e6e6e6; border-radius: 14px; background: #fff; overflow: hidden; }
+.shop-form-top { display: flex; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #ececec; font-size: 13px; letter-spacing: .2em; color: #8a8a8a; }
+.shop-form-grid { display: grid; grid-template-columns: 38% 1fr; border-bottom: 1px solid #ececec; }
+.shop-form-right { border-left: 1px solid #ececec; }
+.shop-form-right .shop-form-cell:first-child { border-bottom: 1px solid #ececec; }
+.shop-form-cell { padding: 12px 16px; border-bottom: 1px solid #ececec; }
+.shop-form-grid .shop-form-cell { border-bottom: none; }
+.shop-form-card > .shop-form-cell:last-child { border-bottom: none; }
+.shop-form-cell label { display: block; margin-bottom: 8px; font-size: 13px; letter-spacing: .06em; color: #8a8a8a; }
+.shop-form-cell label b { color: #8a8a8a; font-weight: 400; }
+.shop-form-cell input, .shop-form-cell textarea { width: 100%; box-sizing: border-box; border: none; outline: none; background: transparent; padding: 4px 0; font-size: 16px; color: #222; font-family: inherit; }
+.shop-form-cell textarea { resize: none; line-height: 1.5; }
+.shop-form-cell input::placeholder { color: #c4c4c4; }
+.shop-img-btn { width: 100%; aspect-ratio: 1; max-width: 120px; border: 1px solid #dcdcdc; border-radius: 10px; background: #f5f5f5; color: #777; font-size: 26px; display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: pointer; padding: 0; -webkit-tap-highlight-color: transparent; }
+.shop-img-btn img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shop-form-foot { flex-shrink: 0; padding: 12px 16px calc(14px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid #ececec; background: #f5f5f5; }
+.shop-send-btn { width: 100%; height: 50px; border: none; border-radius: 25px; background: #383838; color: #fff; font-size: 16px; letter-spacing: .2em; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.shop-send-btn:disabled { opacity: .6; }
